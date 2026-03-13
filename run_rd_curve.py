@@ -47,15 +47,18 @@ def run_proposed_encoding(input_video, output_video, bitrate, threshold,
     processor = DTCWT3DProcessor(threshold=threshold)
 
     total_processed_frames = 0
-    for y_array, u_np, v_np, frames in read_y4m_and_split(
-        input_video, w, h, chunk_size=8
+    for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
+        input_video, w, h, chunk_size=8, overlap=4
     ):
         if total_processed_frames >= max_frames:
             break
 
         processed_y = processor.process_chunk(y_array)
 
-        processed_y_uint8 = (processed_y * 255.0).clip(0, 255).astype(np.uint8)
+        # 겹쳤던 부분(앞쪽 overlap_len 프레임)을 잘라내어 순수 새로운 프레임만 추출
+        processed_y_valid = processed_y[overlap_len:]
+
+        processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
         processed_y_flat = processed_y_uint8.reshape((frames, -1))
 
         for f in range(frames):

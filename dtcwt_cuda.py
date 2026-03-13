@@ -466,7 +466,7 @@ class CudaDTCWT3DProcessor:
         qshift_coeffs = _qshift(qshift_name)
 
         def _t(arr):
-            return torch.from_numpy(arr.flatten().astype(np.float64)).to(self.device)
+            return torch.from_numpy(arr.flatten().astype(np.float32)).to(self.device)
 
         self.h0o, self.g0o, self.h1o, self.g1o = [_t(c) for c in biort_coeffs]
         self.h0a, self.h0b, self.g0a, self.g0b = [_t(c) for c in qshift_coeffs[:4]]
@@ -483,7 +483,7 @@ class CudaDTCWT3DProcessor:
             (lowpass, highpasses_tuple)
         """
         nlevels = nlevels or self.nlevels
-        X = torch.from_numpy(X_np.astype(np.float64)).to(self.device)
+        X = torch.from_numpy(X_np.astype(np.float32)).to(self.device)
 
         Yl = X
         Yh_list = [None] * nlevels
@@ -527,14 +527,38 @@ class CudaDTCWT3DProcessor:
         return X.cpu().numpy()
 
     def apply_shrinkage(self, highpasses):
-        """GPU 상에서 Soft Shrinkage 수행."""
-        shrunk = []
-        for hp in highpasses:
-            mag = torch.abs(hp)
-            phase = torch.where(mag > 0, hp / mag, torch.zeros_like(hp))
-            shrunk_mag = torch.clamp(mag - self.threshold, min=0.0)
-            shrunk.append(phase * shrunk_mag)
-        return tuple(shrunk)
+        """Spatio-Temporal Adaptive Thresholding (BayesShrink 기반)."""
+        # highpasses는 튜플. 각 요소는 (H, W, T, 28) 형태의 복소수 텐서입니다.
+        finest_hps = highpasses[0]
+        
+        # 1. 전역 노이즈 분산 추정
+        finest_mag = torch.abs(finest_hps)
+        mad = torch.median(finest_mag)
+        sigma = mad / 0.6745
+        sigma_sq = sigma ** 2
+        
+        shrunk_levels = []
+        for level_idx, Yh in enumerate(highpasses):
+            # Yh: (H, W, T, 28)
+            mag = torch.abs(Yh)
+            
+            # 방향별(서브밴드별)로 분산을 계산해야 하므로, (H, W, T) 차원에 대해 분산 계산
+            # var shape: (28,)
+            subband_var = torch.var(mag, dim=(0, 1, 2), keepdim=True)
+            
+            signal_var = torch.clamp(subband_var - sigma_sq, min=1e-8)
+            sigma_x = torch.sqrt(signal_var)
+            
+            base_factor = self.threshold * (2.0 ** level_idx)
+            # T_adapt shape: (1, 1, 1, 28)
+            T_adapt = (sigma_sq / sigma_x) * base_factor
+            
+            phase = torch.where(mag > 0, Yh / mag, torch.zeros_like(Yh))
+            shrunk_mag = torch.clamp(mag - T_adapt, min=0.0)
+            
+            shrunk_levels.append(phase * shrunk_mag)
+            
+        return tuple(shrunk_levels)
 
     def process_chunk(self, chunk_numpy):
         """비디오 청크 전처리 (기존 DTCWT3DProcessor 호환 인터페이스).
