@@ -258,4 +258,4 @@ def _plot_advanced_chart(video_name, bitrate,
 
 
 if __name__ == "__main__":
-    evaluate_and_plot_advanced("stefan", "200k")
+    evaluate_and_plot_advanced("mobile", "200k")
