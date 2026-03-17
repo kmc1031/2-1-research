@@ -11,6 +11,7 @@ Baseline(x264 직접 인코딩)과 Proposed(3D DT-CWT 전처리 + x264)를 여�
 
 import csv
 import os
+import cv2
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -38,17 +39,48 @@ def run_baseline_encoding(input_video, output_video, bitrate):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def run_spatial_encoding(input_video, output_video, bitrate, max_frames=float('inf')):
+    """단순 2D 공간 필터(Gaussian Blur)를 적용한 후 x264로 압축하는 비교군을 생성합니다."""
+    print(f"  [Spatial] {bitrate} 전처리 및 인코딩 중 (Gaussian Blur)...")
+    w, h, fps = get_video_metadata(input_video)
+    encoder_process = create_x264_encoder(output_video, w, h, fps, bitrate)
+
+    total_processed_frames = 0
+    # overlap=0 으로 청크를 읽어옴
+    for y_array, u_np, v_np, frames, _ in read_y4m_and_split(
+        input_video, w, h, chunk_size=8, overlap=0, scene_threshold=1.0
+    ):
+        if total_processed_frames >= max_frames:
+            break
+
+        y_uint8 = (y_array * 255.0).clip(0, 255).astype(np.uint8)
+        
+        for f in range(frames):
+            blurred_y = cv2.GaussianBlur(y_uint8[f], (5, 5), 1.5).flatten()
+            encoder_process.stdin.write(blurred_y.tobytes())
+            encoder_process.stdin.write(u_np[f].tobytes())
+            encoder_process.stdin.write(v_np[f].tobytes())
+
+        total_processed_frames += frames
+
+    encoder_process.stdin.close()
+    encoder_process.wait()
+
+
 def run_proposed_encoding(input_video, output_video, bitrate, threshold,
-                          max_frames=float('inf')):
+                          max_frames=float('inf'), disable_overlap=False, disable_adaptive=False):
     """3D DT-CWT 전처리를 거친 후 x264로 압축하는 제안 기법을 생성합니다."""
     print(f"  [Proposed] {bitrate} 전처리 및 인코딩 중 (T={threshold})...")
     w, h, fps = get_video_metadata(input_video)
     encoder_process = create_x264_encoder(output_video, w, h, fps, bitrate)
-    processor = DTCWT3DProcessor(threshold=threshold)
+    
+    adaptive = not disable_adaptive
+    processor = DTCWT3DProcessor(threshold=threshold, adaptive_threshold=adaptive)
 
+    overlap_frames = 0 if disable_overlap else 4
     total_processed_frames = 0
     for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
-        input_video, w, h, chunk_size=8, overlap=4
+        input_video, w, h, chunk_size=8, overlap=overlap_frames
     ):
         if total_processed_frames >= max_frames:
             break
@@ -60,11 +92,14 @@ def run_proposed_encoding(input_video, output_video, bitrate, threshold,
 
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
         processed_y_flat = processed_y_uint8.reshape((frames, -1))
+        
+        # U/V 채널 전처리 (크로마 노이즈 제거)
+        u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
 
         for f in range(frames):
             encoder_process.stdin.write(processed_y_flat[f].tobytes())
-            encoder_process.stdin.write(u_np[f].tobytes())
-            encoder_process.stdin.write(v_np[f].tobytes())
+            encoder_process.stdin.write(u_proc[f].tobytes())
+            encoder_process.stdin.write(v_proc[f].tobytes())
 
         total_processed_frames += frames
 
@@ -73,13 +108,17 @@ def run_proposed_encoding(input_video, output_video, bitrate, threshold,
 
 
 def plot_rd_curve(bitrates_kbps, baseline_scores, proposed_scores, title, filename,
-                  ylabel="PSNR (dB)"):
+                  ylabel="PSNR (dB)", spatial_scores=None):
     """RD Curve 그래프를 생성 및 저장합니다."""
     plt.figure(figsize=(8, 6))
     plt.plot(bitrates_kbps, baseline_scores,
              marker="o", linestyle="-", label="Baseline (x264 only)", color="blue")
     plt.plot(bitrates_kbps, proposed_scores,
              marker="s", linestyle="-", label="Proposed (3D DT-CWT + x264)", color="red")
+    
+    if spatial_scores:
+        plt.plot(bitrates_kbps, spatial_scores,
+                 marker="^", linestyle="--", label="Spatial (Gaussian)", color="green")
 
     plt.title(title, fontsize=14)
     plt.xlabel("Bitrate (kbps)", fontsize=12)
@@ -140,7 +179,7 @@ def calculate_bd_psnr(R1, PSNR1, R2, PSNR2):
     return avg_diff
 
 
-def process_single_video(video_name, input_dir, output_dir, bitrates, threshold):
+def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False):
     """단일 비디오에 대해 모든 비트레이트의 인코딩 + 평가를 수행합니다.
 
     이 함수는 ProcessPoolExecutor의 워커에서 호출되므로,
@@ -157,35 +196,51 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold)
     print(f"  🎬 타겟 비디오: {video_name.upper()}")
     print(f"{'=' * 50}")
 
-    base_psnrs, prop_psnrs = [], []
-    base_vmafs, prop_vmafs = [], []
+    base_psnrs, prop_psnrs, spat_psnrs = [], [], []
+    base_vmafs, prop_vmafs, spat_vmafs = [], [], []
 
     for br in bitrates:
         br_str = f"{br}k"
         base_out = os.path.join(output_dir, f"{video_name}_base_{br_str}.mp4")
         prop_out = os.path.join(output_dir, f"{video_name}_prop_{br_str}.mp4")
+        spat_out = os.path.join(output_dir, f"{video_name}_spat_{br_str}.mp4")
 
         run_baseline_encoding(input_video, base_out, br_str)
-        run_proposed_encoding(input_video, prop_out, br_str, threshold)
+        run_proposed_encoding(input_video, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive)
+        
+        if include_spatial:
+            run_spatial_encoding(input_video, spat_out, br_str)
 
         print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (VMAF 포함)...")
         b_p, b_s, b_v = evaluate_video_quality(input_video, base_out)
         p_p, p_s, p_v = evaluate_video_quality(input_video, prop_out)
+        
+        if include_spatial:
+            s_p, s_s, s_v = evaluate_video_quality(input_video, spat_out)
+            spat_psnrs.append(s_p)
+            spat_vmafs.append(s_v)
+        else:
+            s_p, s_v = 0.0, 0.0
 
         base_psnrs.append(b_p)
         prop_psnrs.append(p_p)
         base_vmafs.append(b_v)
         prop_vmafs.append(p_v)
 
-        print(f"      -> PSNR: {b_p:.2f} vs {p_p:.2f} | VMAF: {b_v:.2f} vs {p_v:.2f}\n")
+        if include_spatial:
+            print(f"      -> PSNR: B({b_p:.2f}) vs P({p_p:.2f}) vs S({s_p:.2f}) | VMAF: B({b_v:.2f}) vs P({p_v:.2f}) vs S({s_v:.2f})\n")
+        else:
+            print(f"      -> PSNR: {b_p:.2f} vs {p_p:.2f} | VMAF: {b_v:.2f} vs {p_v:.2f}\n")
 
     return {
         "video_name": video_name,
         "bitrates": bitrates,
         "base_psnrs": base_psnrs,
         "prop_psnrs": prop_psnrs,
+        "spat_psnrs": spat_psnrs if include_spatial else None,
         "base_vmafs": base_vmafs,
         "prop_vmafs": prop_vmafs,
+        "spat_vmafs": spat_vmafs if include_spatial else None,
     }
 
 
@@ -197,6 +252,9 @@ def report_and_save(result, output_dir):
     prop_psnrs = result["prop_psnrs"]
     base_vmafs = result["base_vmafs"]
     prop_vmafs = result["prop_vmafs"]
+
+    spat_psnrs = result.get("spat_psnrs")
+    spat_vmafs = result.get("spat_vmafs")
 
     # BD-Rate 계산
     bd_rate_psnr = calculate_bd_rate(bitrates, base_psnrs, bitrates, prop_psnrs)
@@ -212,37 +270,62 @@ def report_and_save(result, output_dir):
     csv_filename = os.path.join(output_dir, f"raw_data_{video_name}.csv")
     with open(csv_filename, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["Bitrate(kbps)", "Base_PSNR", "Prop_PSNR",
-                         "Base_VMAF", "Prop_VMAF"])
-        for br, bp, pp, bv, pv in zip(
-            bitrates, base_psnrs, prop_psnrs, base_vmafs, prop_vmafs
-        ):
-            writer.writerow([br, bp, pp, bv, pv])
+        if spat_psnrs:
+            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "Prop_PSNR", "Spat_PSNR",
+                             "Base_VMAF", "Prop_VMAF", "Spat_VMAF"])
+            for br, bp, pp, sp, bv, pv, sv in zip(
+                bitrates, base_psnrs, prop_psnrs, spat_psnrs, base_vmafs, prop_vmafs, spat_vmafs
+            ):
+                writer.writerow([br, bp, pp, sp, bv, pv, sv])
+        else:
+            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "Prop_PSNR",
+                             "Base_VMAF", "Prop_VMAF"])
+            for br, bp, pp, bv, pv in zip(
+                bitrates, base_psnrs, prop_psnrs, base_vmafs, prop_vmafs
+            ):
+                writer.writerow([br, bp, pp, bv, pv])
 
     # RD Curve 생성
     plot_rd_curve(
         bitrates, base_psnrs, prop_psnrs,
         title=f"PSNR RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_rate_psnr:.2f}%",
         filename=os.path.join(output_dir, f"rd_curve_psnr_{video_name}.png"),
+        spatial_scores=spat_psnrs
     )
     plot_rd_curve(
         bitrates, base_vmafs, prop_vmafs,
         title=f"VMAF RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_rate_vmaf:.2f}%",
         filename=os.path.join(output_dir, f"rd_curve_vmaf_{video_name}.png"),
         ylabel="VMAF Score",
+        spatial_scores=spat_vmafs
     )
 
 
 # --- 메인 실험 루프 ---
 if __name__ == "__main__":
-    VIDEO_NAMES = ["akiyo", "foreman", "mobile", "stefan"]
-    INPUT_DIR = "./videos"
-    OUTPUT_DIR = "./outputs"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="RD Curve 실험을 위한 자동화 파이프라인")
+    parser.add_argument("-v", "--video_names", nargs='+', default=["akiyo", "foreman", "mobile", "stefan"], help="처리할 비디오 이름 목록 (예: akiyo foreman)")
+    parser.add_argument("-i", "--input_dir", default="./videos", help="입력 비디오 디렉토리")
+    parser.add_argument("-o", "--output_dir", default="./outputs", help="출력 디렉토리 (자동 생성)")
+    parser.add_argument("-b", "--bitrates", nargs='+', type=int, default=[100, 200, 300, 400, 500], help="테스트할 비트레이트 목록(kbps)")
+    parser.add_argument("-t", "--threshold", type=float, default=0.03, help="DT-CWT 임계값")
+    parser.add_argument("--max_workers", type=int, default=None, help="병렬 처리 워커 수 (기본값: 코어 수에 맞게 자동 설정)")
+    parser.add_argument("--disable_overlap", action="store_true", help="오버랩 방식 블록 기반 처리 비활성화")
+    parser.add_argument("--disable_adaptive_threshold", action="store_true", help="적응형 임계값 산출 로직 비활성화")
+    parser.add_argument("--include_spatial", action="store_true", help="단순 2D 공간 필터(Gaussian) 비교군 포함")
+    
+    args = parser.parse_args()
+
+    VIDEO_NAMES = args.video_names
+    INPUT_DIR = args.input_dir
+    OUTPUT_DIR = args.output_dir
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    BITRATES = [100, 200, 300, 400, 500]
-    THRESHOLD = 0.03
-    MAX_WORKERS = min(len(VIDEO_NAMES), os.cpu_count() or 1)
+    BITRATES = args.bitrates
+    THRESHOLD = args.threshold
+    MAX_WORKERS = min(len(VIDEO_NAMES), args.max_workers if args.max_workers else (os.cpu_count() or 1))
 
     print(f"=== 🚀 다중 비디오 자동화 시작 (병렬: {MAX_WORKERS}개 워커) ===")
 
@@ -250,7 +333,7 @@ if __name__ == "__main__":
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD
+                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial
             ): name
             for name in VIDEO_NAMES
         }
