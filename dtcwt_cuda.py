@@ -455,11 +455,13 @@ class CudaDTCWT3DProcessor:
     """
 
     def __init__(self, threshold=0.03, nlevels=1, device='cuda',
+                 adaptive_threshold=True,
                  biort_name='near_sym_a', qshift_name='qshift_a'):
         self.threshold = threshold
         self.nlevels = nlevels
         self.device = torch.device(device)
         self.ext_mode = 4
+        self.adaptive_threshold = adaptive_threshold
 
         # 필터 계수 로딩 → PyTorch 텐서
         biort_coeffs = _biort(biort_name)
@@ -527,7 +529,17 @@ class CudaDTCWT3DProcessor:
         return X.cpu().numpy()
 
     def apply_shrinkage(self, highpasses):
-        """Spatio-Temporal Adaptive Thresholding (BayesShrink 기반)."""
+        """Spatio-Temporal Adaptive Thresholding (BayesShrink 기반) 또는 고정 임계값 감산."""
+        if not self.adaptive_threshold:
+            shrunk_levels = []
+            for Yh in highpasses:
+                mag = torch.abs(Yh)
+                phase = torch.where(mag > 0, Yh / mag, torch.zeros_like(Yh))
+                shrunk_mag = torch.clamp(mag - self.threshold, min=0.0)
+                shrunk_levels.append(phase * shrunk_mag)
+            return tuple(shrunk_levels)
+            
+        # adaptive_threshold == True 인 경우
         # highpasses는 튜플. 각 요소는 (H, W, T, 28) 형태의 복소수 텐서입니다.
         finest_hps = highpasses[0]
         

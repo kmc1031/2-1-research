@@ -53,11 +53,12 @@ def get_video_metadata(file_path):
     return width, height, fps
 
 
-def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4):
+def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_threshold=0.1):
     """Y4M 비디오를 청크 단위로 읽어 Y/U/V 채널을 분리하여 반환합니다.
 
     시간축 아티팩트를 방지하기 위해 이전 청크의 마지막 overlap 개 프레임을
     현재 청크 앞에 덧붙여 반환합니다 (Overlap-Save 방식).
+    만약 청크 경계에서 장면 전환(Scene Change)이 감지되면 오버랩을 무시합니다.
     
     Y 채널은 [0, 1] float32로 정규화하고,
     U/V 채널은 원본 uint8 바이트 배열 그대로 유지합니다.
@@ -68,14 +69,10 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4):
         height: 비디오 높이.
         chunk_size: 한 번에 반환할 순수 프레임 수.
         overlap: 겹칠 프레임 수.
+        scene_threshold: 장면 전환 감지 Luma SAD 임계값 [0, 1].
 
     Yields:
         (y_array, u_array, v_array, actual_frames, overlap_len) 튜플.
-        - y_array: (T, H, W) float32 [0, 1] (T = overlap_len + actual_frames)
-        - u_array: (actual_frames, W*H/4) uint8 (원본 프레임만)
-        - v_array: (actual_frames, W*H/4) uint8 (원본 프레임만)
-        - actual_frames: 실제로 읽은 순수 새로운 프레임 수
-        - overlap_len: 이번 청크에 앞부분에 추가된 오버랩 프레임 수 (맨 처음은 0)
     """
     y_size = width * height
     uv_size = y_size // 4
@@ -91,6 +88,7 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4):
     )
 
     prev_y_overlap = None
+    chunk_idx = 0
 
     try:
         while True:
@@ -115,10 +113,17 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4):
             # Y 채널만 [0, 1] float32로 정규화
             y_normalized = y_channel.astype(np.float32) / 255.0
 
-            # 오버랩 윈도우 결합
+            # 오버랩 윈도우 결합 및 장면 전환 감지
             if prev_y_overlap is not None:
-                y_with_overlap = np.concatenate([prev_y_overlap, y_normalized], axis=0)
-                overlap_len = len(prev_y_overlap)
+                # SAD (Sum of Absolute Differences) 대신 MAD (Mean Absolute Difference) 사용
+                diff = np.mean(np.abs(y_normalized[0] - prev_y_overlap[-1]))
+                if diff > scene_threshold:
+                    print(f"  [장면 전환 감지] Chunk {chunk_idx} - MAD: {diff:.3f} > {scene_threshold}. 오버랩을 초기화합니다.")
+                    y_with_overlap = y_normalized
+                    overlap_len = 0
+                else:
+                    y_with_overlap = np.concatenate([prev_y_overlap, y_normalized], axis=0)
+                    overlap_len = len(prev_y_overlap)
             else:
                 y_with_overlap = y_normalized
                 overlap_len = 0
@@ -129,6 +134,7 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4):
                 prev_y_overlap = None
 
             yield y_with_overlap, u_channel, v_channel, actual_frames, overlap_len
+            chunk_idx += 1
     finally:
         process.stdout.close()
         process.wait()
@@ -161,9 +167,21 @@ def create_x264_encoder(output_path, width, height, fps, bitrate='100k'):
 
 # --- 메인 실행 파이프라인 ---
 if __name__ == "__main__":
-    INPUT_VIDEO = "./videos/akiyo.y4m"
-    TARGET_BITRATE = "100k"
-    OUTPUT_VIDEO = f"akiyo_processed_{TARGET_BITRATE}.mp4"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="3D DT-CWT 비디오 전처리 및 인코딩 파이프라인")
+    parser.add_argument("-i", "--input_video", default="./videos/akiyo.y4m", help="입력 Y4M 비디오 파일 경로")
+    parser.add_argument("-b", "--bitrate", default="100k", help="목표 비트레이트 (예: '100k', '500k')")
+    parser.add_argument("-o", "--output_video", help="출력 MP4 파일 경로 (기본값: 자동 생성)")
+    parser.add_argument("-t", "--threshold", type=float, default=0.03, help="DT-CWT 임계값")
+    parser.add_argument("-c", "--chunk_size", type=int, default=8, help="처리 청크 크기 (순수 프레임 수)")
+    parser.add_argument("--overlap", type=int, default=4, help="시간축 아티팩트 방지를 위한 겹침 프레임 수")
+
+    args = parser.parse_args()
+
+    INPUT_VIDEO = args.input_video
+    TARGET_BITRATE = args.bitrate
+    OUTPUT_VIDEO = args.output_video if args.output_video else f"{os.path.splitext(os.path.basename(INPUT_VIDEO))[0]}_processed_{TARGET_BITRATE}.mp4"
 
     print(f"파이프라인을 시작합니다.")
 
@@ -175,14 +193,14 @@ if __name__ == "__main__":
     encoder_process = create_x264_encoder(OUTPUT_VIDEO, w, h, fps, TARGET_BITRATE)
 
     # 3. 3D DT-CWT 프로세서 초기화
-    processor = DTCWT3DProcessor(threshold=0.03)
+    processor = DTCWT3DProcessor(threshold=args.threshold)
 
     print("스트리밍 전처리 및 인코딩 진행 중...")
 
     # 4. 청크 단위 스트리밍 처리
     chunk_idx = 0
     for y_array, u_np, v_np, frames_in_chunk, overlap_len in read_y4m_and_split(
-        INPUT_VIDEO, w, h, chunk_size=8, overlap=4
+        INPUT_VIDEO, w, h, chunk_size=args.chunk_size, overlap=args.overlap
     ):
         # DT-CWT 전처리 (Y 채널만, 오버랩 포함된 임시 T 프레임)
         processed_y = processor.process_chunk(y_array)
@@ -193,16 +211,19 @@ if __name__ == "__main__":
         # [0, 1] float → [0, 255] uint8 변환
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
         processed_y_flat = processed_y_uint8.reshape((frames_in_chunk, -1))
+        
+        # U/V 채널 전처리 (크로마 노이즈 제거)
+        u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
 
         # 인코더로 프레임 단위 쓰기 (Y + U + V)
         for f in range(frames_in_chunk):
             encoder_process.stdin.write(processed_y_flat[f].tobytes())
-            encoder_process.stdin.write(u_np[f].tobytes())
-            encoder_process.stdin.write(v_np[f].tobytes())
+            encoder_process.stdin.write(u_proc[f].tobytes())
+            encoder_process.stdin.write(v_proc[f].tobytes())
 
         chunk_idx += 1
         if chunk_idx % 5 == 0:
-            print(f"  ... {chunk_idx * 8} 프레임 처리 완료")
+            print(f"  ... {chunk_idx * args.chunk_size} 프레임 처리 완료")
 
     # 5. 파이프 종료 및 인코딩 마무리
     encoder_process.stdin.close()
