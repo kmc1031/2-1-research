@@ -6,6 +6,8 @@ Y/U/V 채널을 분리하여 Y 채널에만 DT-CWT 전처리를 적용하고,
 """
 
 import os
+import subprocess
+import re
 
 import ffmpeg
 import numpy as np
@@ -53,7 +55,30 @@ def get_video_metadata(file_path):
     return width, height, fps
 
 
-def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_threshold=0.1):
+def get_scene_changes(file_path, fps, threshold=10.0):
+    """FFmpeg scdet 필터를 사용하여 장면 전환 인덱스 세트를 반환합니다."""
+    cmd = [
+        "ffmpeg", "-y", "-i", file_path,
+        "-vf", f"scdet=threshold={threshold}",
+        "-f", "null", "-"
+    ]
+    process = subprocess.Popen(
+        cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, universal_newlines=True
+    )
+    
+    scene_frames = set()
+    pattern = re.compile(r"lavfi\.scdet\.time:\s*([\d\.]+)")
+    
+    for line in process.stderr:
+        match = pattern.search(line)
+        if match:
+            time_sec = float(match.group(1))
+            scene_frames.add(int(round(time_sec * fps)))
+            
+    process.wait()
+    return scene_frames
+
+def read_y4m_and_split(file_path, width, height, fps, chunk_size=8, overlap=4, scene_threshold=10.0):
     """Y4M 비디오를 청크 단위로 읽어 Y/U/V 채널을 분리하여 반환합니다.
 
     시간축 아티팩트를 방지하기 위해 이전 청크의 마지막 overlap 개 프레임을
@@ -67,9 +92,10 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_
         file_path: 비디오 파일 경로.
         width: 비디오 너비.
         height: 비디오 높이.
+        fps: 비디오 프레임레이트.
         chunk_size: 한 번에 반환할 순수 프레임 수.
         overlap: 겹칠 프레임 수.
-        scene_threshold: 장면 전환 감지 Luma SAD 임계값 [0, 1].
+        scene_threshold: 장면 전환 감지 임계값 (0~100, scdet 기본값 10).
 
     Yields:
         (y_array, u_array, v_array, actual_frames, overlap_len) 튜플.
@@ -78,6 +104,9 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_
     uv_size = y_size // 4
     frame_bytes = y_size + (uv_size * 2)
     chunk_bytes = frame_bytes * chunk_size
+
+    # 사전에 전체 장면 전환 프레임을 미리 파싱
+    scene_frames = get_scene_changes(file_path, fps, threshold=scene_threshold)
 
     process = (
         ffmpeg
@@ -89,6 +118,7 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_
 
     prev_y_overlap = None
     chunk_idx = 0
+    current_frame_idx = 0
 
     try:
         while True:
@@ -100,25 +130,26 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_
             if actual_frames == 0:
                 break
 
-            # 1D 바이트 배열을 프레임 단위로 재배열
             raw_data = np.frombuffer(in_bytes, dtype=np.uint8).reshape(
                 (actual_frames, frame_bytes)
             )
 
-            # Y, U, V 분리
             y_channel = raw_data[:, :y_size].reshape((actual_frames, height, width))
             u_channel = raw_data[:, y_size:y_size + uv_size]
             v_channel = raw_data[:, y_size + uv_size:]
 
-            # Y 채널만 [0, 1] float32로 정규화
             y_normalized = y_channel.astype(np.float32) / 255.0
 
-            # 오버랩 윈도우 결합 및 장면 전환 감지
+            # 파싱된 FFmpeg 메타데이터를 기반으로 현재 청크 내에 장면 전환이 있는지 확인
+            has_scene_change = False
+            for f in range(current_frame_idx, current_frame_idx + actual_frames):
+                if f in scene_frames:
+                    has_scene_change = True
+                    break
+
             if prev_y_overlap is not None:
-                # SAD (Sum of Absolute Differences) 대신 MAD (Mean Absolute Difference) 사용
-                diff = np.mean(np.abs(y_normalized[0] - prev_y_overlap[-1]))
-                if diff > scene_threshold:
-                    print(f"  [장면 전환 감지] Chunk {chunk_idx} - MAD: {diff:.3f} > {scene_threshold}. 오버랩을 초기화합니다.")
+                if has_scene_change:
+                    print(f"  [장면 전환 감지 (Metadata)] Chunk {chunk_idx}. 오버랩 및 캐시를 초기화합니다.")
                     y_with_overlap = y_normalized
                     overlap_len = 0
                 else:
@@ -128,12 +159,12 @@ def read_y4m_and_split(file_path, width, height, chunk_size=8, overlap=4, scene_
                 y_with_overlap = y_normalized
                 overlap_len = 0
                 
-            # 다음 번을 위해 현재 청크의 마지막 overlap 개 프레임 저장
             prev_y_overlap = y_normalized[-overlap:]
             if len(prev_y_overlap) == 0:
                 prev_y_overlap = None
 
             yield y_with_overlap, u_channel, v_channel, actual_frames, overlap_len
+            current_frame_idx += actual_frames
             chunk_idx += 1
     finally:
         process.stdout.close()
@@ -200,10 +231,10 @@ if __name__ == "__main__":
     # 4. 청크 단위 스트리밍 처리
     chunk_idx = 0
     for y_array, u_np, v_np, frames_in_chunk, overlap_len in read_y4m_and_split(
-        INPUT_VIDEO, w, h, chunk_size=args.chunk_size, overlap=args.overlap
+        INPUT_VIDEO, w, h, fps=fps, chunk_size=args.chunk_size, overlap=args.overlap
     ):
         # DT-CWT 전처리 (Y 채널만, 오버랩 포함된 임시 T 프레임)
-        processed_y = processor.process_chunk(y_array)
+        processed_y = processor.process_chunk(y_array, overlap_len=overlap_len)
 
         # 겹쳤던 부분(앞쪽 overlap_len 프레임)을 잘라내어 순수 새로운 프레임만 추출
         processed_y_valid = processed_y[overlap_len:]

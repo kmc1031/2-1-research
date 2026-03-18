@@ -29,10 +29,13 @@ class DTCWT3DProcessor:
     CUDA 가용 시 자동으로 GPU 가속을 사용합니다.
     """
 
-    def __init__(self, threshold=0.03, nlevels=1, adaptive_threshold=True):
+    def __init__(self, threshold=0.03, nlevels=1, adaptive_threshold=True, use_coef_cache=True):
         self.threshold = threshold
         self.nlevels = nlevels
         self.adaptive_threshold = adaptive_threshold
+        self.use_coef_cache = use_coef_cache
+        self.cached_Yl = None
+        self.cached_Yh = None
 
         if _USE_CUDA:
             self._cuda_proc = CudaDTCWT3DProcessor(
@@ -71,8 +74,8 @@ class DTCWT3DProcessor:
         for level_idx, hp in enumerate(highpasses):
             mag = np.abs(hp)
             
-            # 서브밴드별 분산 계산 (H, W, T 축)
-            subband_var = np.var(mag, axis=(0, 1, 2), keepdims=True)
+            # 서브밴드별 분산 계산 (H, W, T 축) (PyTorch의 unbiased=True와 일치하도록 ddof=1 설정)
+            subband_var = np.var(mag, axis=(0, 1, 2), ddof=1, keepdims=True)
             
             signal_var = np.maximum(subband_var - sigma_sq, 1e-8)
             sigma_x = np.sqrt(signal_var)
@@ -89,7 +92,7 @@ class DTCWT3DProcessor:
             
         return tuple(shrunk_levels)
 
-    def process_chunk(self, chunk_numpy):
+    def process_chunk(self, chunk_numpy, overlap_len=0):
         """비디오 청크에 3D DT-CWT 전처리를 적용합니다.
 
         홀수 크기의 차원이 입력으로 들어오면 짝수 크기로 패딩을 적용하여
@@ -97,6 +100,7 @@ class DTCWT3DProcessor:
 
         Args:
             chunk_numpy: (T, H, W) 형태의 NumPy 배열. 값 범위 [0, 1].
+            overlap_len: 이전 청크와의 오버랩 프레임 수
 
         Returns:
             전처리된 (T, H, W) NumPy 배열. 값 범위 [0, 1].
@@ -115,15 +119,83 @@ class DTCWT3DProcessor:
                 mode='symmetric'
             )
 
-        if _USE_CUDA:
-            result = self._cuda_proc.process_chunk(chunk_numpy)
+        if self.use_coef_cache and overlap_len > 0 and self.cached_Yl is not None:
+            # 시간축 오버랩 구간에 대해 공간 변환(Forward) 생략 (계수 레벨 캐시 활용)
+            # 신규 프레임 추출
+            new_chunk = chunk_numpy[overlap_len:]
+            cube_new = new_chunk.transpose(1, 2, 0)
+            
+            if _USE_CUDA:
+                import torch
+                Yl_new, Yh_new = self._cuda_proc.forward(cube_new)
+                
+                # CPU RAM에서 VRAM으로 업로드
+                cached_Yl_gpu = self.cached_Yl.to(self._cuda_proc.device)
+                cached_Yh_gpu = tuple([h.to(self._cuda_proc.device) for h in self.cached_Yh])
+                
+                # 시간축 결합
+                Yl_full = torch.cat([cached_Yl_gpu, Yl_new], dim=2)
+                Yh_full = tuple([torch.cat([h_old, h_new], dim=2) for h_old, h_new in zip(cached_Yh_gpu, Yh_new)])
+                
+                Yh_shrunk = self._cuda_proc.apply_shrinkage(Yh_full)
+                reconstructed = self._cuda_proc.inverse(Yl_full, Yh_shrunk)
+                res_np = reconstructed
+            else:
+                Yl_new, Yh_new_tuple = self._transform.forward(cube_new, nlevels=self.nlevels)
+                Yh_new = Yh_new_tuple.highpasses
+                
+                Yl_full = np.concatenate([self.cached_Yl, Yl_new], axis=2)
+                Yh_full = tuple([np.concatenate([h_old, h_new], axis=2) for h_old, h_new in zip(self.cached_Yh, Yh_new)])
+                
+                Yh_shrunk = self._apply_shrinkage_cpu(Yh_full)
+                
+                import dtcwt
+                class TempPyr:
+                    def __init__(self, l, h):
+                        self.lowpass = l
+                        self.highpasses = h
+                
+                reconstructed = self._transform.inverse(TempPyr(Yl_full, Yh_shrunk))
+                res_np = reconstructed
+
+            Yl_for_cache = Yl_full
+            Yh_for_cache = Yh_full
+            result = np.clip(res_np.transpose(2, 0, 1), 0.0, 1.0)
+            
         else:
-            # CPU 경로
+            # 캐시가 없거나 미사용 시 전체 프레임 Forward 연산
             cube = chunk_numpy.transpose(1, 2, 0)
-            pyramid = self._transform.forward(cube, nlevels=self.nlevels)
-            pyramid.highpasses = self._apply_shrinkage_cpu(pyramid.highpasses)
-            reconstructed = self._transform.inverse(pyramid)
-            result = np.clip(reconstructed.transpose(2, 0, 1), 0.0, 1.0)
+            if _USE_CUDA:
+                Yl_for_cache, Yh_for_cache = self._cuda_proc.forward(cube)
+                Yh_shrunk = self._cuda_proc.apply_shrinkage(Yh_for_cache)
+                reconstructed = self._cuda_proc.inverse(Yl_for_cache, Yh_shrunk)
+                res_np = reconstructed
+            else:
+                pyramid = self._transform.forward(cube, nlevels=self.nlevels)
+                Yl_for_cache = pyramid.lowpass
+                Yh_for_cache = pyramid.highpasses
+                pyramid.highpasses = self._apply_shrinkage_cpu(pyramid.highpasses)
+                reconstructed = self._transform.inverse(pyramid)
+                res_np = reconstructed
+                
+            result = np.clip(res_np.transpose(2, 0, 1), 0.0, 1.0)
+            
+        # 다음 청크를 위해 OOM 방지용으로 VRAM에서 CPU RAM으로 Offload 및 캐싱 수행
+        if self.use_coef_cache and overlap_len > 0:
+            o_t = int(Yl_for_cache.shape[2] * (overlap_len / chunk_numpy.shape[0]))
+            if o_t == 0: o_t = overlap_len
+            
+            if _USE_CUDA:
+                import torch
+                # VRAM Memory GC (Offload to CPU)
+                self.cached_Yl = Yl_for_cache[:, :, -o_t:].detach().cpu()
+                self.cached_Yh = tuple([h[:, :, -int(h.shape[2] * (overlap_len / chunk_numpy.shape[0])):, :].detach().cpu() for h in Yh_for_cache])
+            else:
+                self.cached_Yl = Yl_for_cache[:, :, -o_t:]
+                self.cached_Yh = tuple([h[:, :, -int(h.shape[2] * (overlap_len / chunk_numpy.shape[0])):] for h in Yh_for_cache])
+        else:
+            self.cached_Yl = None
+            self.cached_Yh = None
             
         # 원래 크기로 복원 (Crop)
         if pad_t > 0 or pad_h > 0 or pad_w > 0:
@@ -134,7 +206,7 @@ class DTCWT3DProcessor:
         return result
 
     def process_chroma(self, u_flat, v_flat, w, h):
-        """U, V 채널 (평면 배열)에 대해 간소화된 2D DT-CWT 노이즈 제거 진행.
+        """U, V 채널도 Y 채널과 동일하게 3D DT-CWT 공간-시간 필터링을 적용합니다.
         
         Args:
             u_flat: (frames, w*h//4) uint8
@@ -148,54 +220,27 @@ class DTCWT3DProcessor:
         frames = u_flat.shape[0]
         cw, ch = w // 2, h // 2
         
-        if not hasattr(self, '_transform2d'):
-            import dtcwt
-            self._transform2d = dtcwt.Transform2d(biort='near_sym_a', qshift='qshift_a')
-            
-        u_out = np.zeros_like(u_flat)
-        v_out = np.zeros_like(v_flat)
+        # [0, 1] float32 변환 및 3D 텐서 (T, H, W) 형태로 reshape
+        u_cube = u_flat.reshape((frames, ch, cw)).astype(np.float32) / 255.0
+        v_cube = v_flat.reshape((frames, ch, cw)).astype(np.float32) / 255.0
         
-        chroma_thresh = self.threshold * 1.5 # 색상 채널은 좀 더 강하게 컷오프
+        # 색상 채널은 좀 더 강하게 컷오프하기 위해 threshold 임시 1.5배 증가
+        orig_thresh = self.threshold
+        self.threshold = orig_thresh * 1.5
+        if _USE_CUDA:
+            self._cuda_proc.threshold = orig_thresh * 1.5
+            
+        # 3D DT-CWT 적용
+        u_proc = self.process_chunk(u_cube)
+        v_proc = self.process_chunk(v_cube)
         
-        for f in range(frames):
-            u_frame = u_flat[f].reshape((ch, cw)).astype(np.float32) / 255.0
-            v_frame = v_flat[f].reshape((ch, cw)).astype(np.float32) / 255.0
+        # threshold 복구
+        self.threshold = orig_thresh
+        if _USE_CUDA:
+            self._cuda_proc.threshold = orig_thresh
             
-            # 홀수 패딩
-            pad_h, pad_w = ch % 2, cw % 2
-            if pad_h > 0 or pad_w > 0:
-                u_frame = np.pad(u_frame, ((0, pad_h), (0, pad_w)), mode='symmetric')
-                v_frame = np.pad(v_frame, ((0, pad_h), (0, pad_w)), mode='symmetric')
-                
-            # U 채널 2D
-            u_pyr = self._transform2d.forward(u_frame, nlevels=1)
-            u_shrunk = []
-            for hp in u_pyr.highpasses:
-                mag = np.abs(hp)
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    phase = hp / mag
-                    phase[np.isnan(phase)] = 0.0
-                u_shrunk.append(phase * np.maximum(mag - chroma_thresh, 0.0))
-            u_pyr.highpasses = tuple(u_shrunk)
-            u_rec = self._transform2d.inverse(u_pyr)
-            
-            # V 채널 2D
-            v_pyr = self._transform2d.forward(v_frame, nlevels=1)
-            v_shrunk = []
-            for hp in v_pyr.highpasses:
-                mag = np.abs(hp)
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    phase = hp / mag
-                    phase[np.isnan(phase)] = 0.0
-                v_shrunk.append(phase * np.maximum(mag - chroma_thresh, 0.0))
-            v_pyr.highpasses = tuple(v_shrunk)
-            v_rec = self._transform2d.inverse(v_pyr)
-            
-            if pad_h > 0 or pad_w > 0:
-                u_rec = u_rec[:ch, :cw]
-                v_rec = v_rec[:ch, :cw]
-                
-            u_out[f] = (np.clip(u_rec, 0.0, 1.0) * 255.0).astype(np.uint8).flatten()
-            v_out[f] = (np.clip(v_rec, 0.0, 1.0) * 255.0).astype(np.uint8).flatten()
-            
+        # uint8 변환 및 1D 평면 포맷(flat)으로 복구
+        u_out = (np.clip(u_proc, 0.0, 1.0) * 255.0).astype(np.uint8).reshape((frames, -1))
+        v_out = (np.clip(v_proc, 0.0, 1.0) * 255.0).astype(np.uint8).reshape((frames, -1))
+        
         return u_out, v_out

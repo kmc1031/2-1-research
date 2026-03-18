@@ -58,14 +58,24 @@ def main():
     diff = np.abs(orig_float - proc_float)
     amplified = np.clip(diff * args.contrast, 0, 255).astype(np.uint8)
     
+    # Residual Edge Analysis (구조적 에지 보존 검증을 위한 잔차의 윤곽선 추출)
+    sobelx = cv2.Sobel(amplified, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(amplified, cv2.CV_64F, 0, 1, ksize=3)
+    edge_mag = np.sqrt(sobelx**2 + sobely**2)
+    edge_mag = np.uint8(255 * edge_mag / np.max(edge_mag)) if np.max(edge_mag) > 0 else np.zeros_like(amplified)
+    
     cv2.imwrite(args.out, amplified)
     print(f"잔차 이미지가 저장되었습니다: {args.out} (증폭: x{args.contrast})")
     
-    # 추가로 비교가 쉽도록 가로로 이어붙인 (원본 | 처리본 | 잔차) 이미지 생성
-    combined = np.hstack((orig_y, proc_y, amplified))
+    edge_out = os.path.splitext(args.out)[0] + "_edges.png"
+    cv2.imwrite(edge_out, edge_mag)
+    print(f"잔차의 에지(윤곽선) 이미지가 저장되었습니다: {edge_out} (구조적 에지 파괴 여부 검증용)")
+    
+    # 추가로 비교가 쉽도록 가로로 이어붙인 (원본 | 처리본 | 잔차 | 잔차 에지) 이미지 생성
+    combined = np.hstack((orig_y, proc_y, amplified, edge_mag))
     combined_out = os.path.splitext(args.out)[0] + "_combined.png"
     cv2.imwrite(combined_out, combined)
-    print(f"비교 이미지가 저장되었습니다: {combined_out}")
+    print(f"비교 이미지가 저장되었습니다: {combined_out} [원본, 처리본, 잔차, 잔차에지]")
 
 if __name__ == "__main__":
     main()
