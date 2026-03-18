@@ -555,8 +555,9 @@ class CudaDTCWT3DProcessor:
             mag = torch.abs(Yh)
             
             # 방향별(서브밴드별)로 분산을 계산해야 하므로, (H, W, T) 차원에 대해 분산 계산
+            # CPU 버전(ddof=1)과 완벽 동일한 동작을 위해 unbiased=True 명시
             # var shape: (28,)
-            subband_var = torch.var(mag, dim=(0, 1, 2), keepdim=True)
+            subband_var = torch.var(mag, dim=(0, 1, 2), unbiased=True, keepdim=True)
             
             signal_var = torch.clamp(subband_var - sigma_sq, min=1e-8)
             sigma_x = torch.sqrt(signal_var)

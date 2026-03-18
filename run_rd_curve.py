@@ -48,7 +48,7 @@ def run_spatial_encoding(input_video, output_video, bitrate, max_frames=float('i
     total_processed_frames = 0
     # overlap=0 으로 청크를 읽어옴
     for y_array, u_np, v_np, frames, _ in read_y4m_and_split(
-        input_video, w, h, chunk_size=8, overlap=0, scene_threshold=1.0
+        input_video, w, h, fps=fps, chunk_size=8, overlap=0, scene_threshold=100.0
     ):
         if total_processed_frames >= max_frames:
             break
@@ -58,6 +58,58 @@ def run_spatial_encoding(input_video, output_video, bitrate, max_frames=float('i
         for f in range(frames):
             blurred_y = cv2.GaussianBlur(y_uint8[f], (5, 5), 1.5).flatten()
             encoder_process.stdin.write(blurred_y.tobytes())
+            encoder_process.stdin.write(u_np[f].tobytes())
+            encoder_process.stdin.write(v_np[f].tobytes())
+
+        total_processed_frames += frames
+
+    encoder_process.stdin.close()
+    encoder_process.wait()
+
+
+def run_dwt3d_encoding(input_video, output_video, bitrate, threshold=0.03, max_frames=float('inf')):
+    """일반 3D DWT(Discrete Wavelet Transform, PyWavelets) 기반 전처리 후 인코딩하는 비교군을 생성합니다."""
+    print(f"  [DWT3D]   {bitrate} 전처리 및 인코딩 중 (General 3D DWT, T={threshold})...")
+    w, h, fps = get_video_metadata(input_video)
+    encoder_process = create_x264_encoder(output_video, w, h, fps, bitrate)
+    
+    try:
+        import pywt
+    except ImportError:
+        print("  [에러] PyWavelets 패키지가 없습니다. 원본 그대로 인코딩합니다.")
+        pywt = None
+
+    total_processed_frames = 0
+    # DT-CWT와 동일한 조건(오버랩)을 부여하여 공정한 비교를 수행
+    for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
+        input_video, w, h, fps=fps, chunk_size=8, overlap=4
+    ):
+        if total_processed_frames >= max_frames:
+            break
+
+        if pywt is not None:
+            # 3D DWT 변환 (Haar 파장이 3D 비디오 연산에 흔히 쓰임)
+            coeffs = pywt.dwtn(y_array, 'haar')
+            
+            # 고주파 부분(Details)에만 Soft Thresholding 적용
+            shrunk_coeffs = {}
+            for k, v in coeffs.items():
+                if k == 'aaa': # Approximation (Lowpass)
+                    shrunk_coeffs[k] = v
+                else:          # Details (Highpass)
+                    shrunk_coeffs[k] = pywt.threshold(v, threshold, mode='soft')
+            
+            processed_y = pywt.idwtn(shrunk_coeffs, 'haar')
+        else:
+            processed_y = y_array
+
+        processed_y_valid = processed_y[overlap_len:]
+        processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
+        processed_y_flat = processed_y_uint8.reshape((frames, -1))
+        
+        # 크로마는 원본 유지
+        for f in range(frames):
+            encoder_process.stdin.write(processed_y_flat[f].tobytes())
             encoder_process.stdin.write(u_np[f].tobytes())
             encoder_process.stdin.write(v_np[f].tobytes())
 
@@ -80,7 +132,7 @@ def run_proposed_encoding(input_video, output_video, bitrate, threshold,
     overlap_frames = 0 if disable_overlap else 4
     total_processed_frames = 0
     for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
-        input_video, w, h, chunk_size=8, overlap=overlap_frames
+        input_video, w, h, fps=fps, chunk_size=8, overlap=overlap_frames
     ):
         if total_processed_frames >= max_frames:
             break
@@ -107,14 +159,16 @@ def run_proposed_encoding(input_video, output_video, bitrate, threshold,
     encoder_process.wait()
 
 
-def plot_rd_curve(bitrates_kbps, baseline_scores, proposed_scores, title, filename,
+def plot_rd_curve(bitrates_kbps, baseline_scores, proposed_scores, dwt_scores, title, filename,
                   ylabel="PSNR (dB)", spatial_scores=None):
     """RD Curve 그래프를 생성 및 저장합니다."""
     plt.figure(figsize=(8, 6))
     plt.plot(bitrates_kbps, baseline_scores,
              marker="o", linestyle="-", label="Baseline (x264 only)", color="blue")
+    plt.plot(bitrates_kbps, dwt_scores,
+             marker="s", linestyle="-.", label="Ablation (General 3D DWT)", color="orange")
     plt.plot(bitrates_kbps, proposed_scores,
-             marker="s", linestyle="-", label="Proposed (3D DT-CWT + x264)", color="red")
+             marker="D", linestyle="-", label="Proposed (3D DT-CWT + x264)", color="red")
     
     if spatial_scores:
         plt.plot(bitrates_kbps, spatial_scores,
@@ -196,16 +250,18 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
     print(f"  🎬 타겟 비디오: {video_name.upper()}")
     print(f"{'=' * 50}")
 
-    base_psnrs, prop_psnrs, spat_psnrs = [], [], []
-    base_vmafs, prop_vmafs, spat_vmafs = [], [], []
+    base_psnrs, prop_psnrs, spat_psnrs, dwt_psnrs = [], [], [], []
+    base_vmafs, prop_vmafs, spat_vmafs, dwt_vmafs = [], [], [], []
 
     for br in bitrates:
         br_str = f"{br}k"
         base_out = os.path.join(output_dir, f"{video_name}_base_{br_str}.mp4")
         prop_out = os.path.join(output_dir, f"{video_name}_prop_{br_str}.mp4")
         spat_out = os.path.join(output_dir, f"{video_name}_spat_{br_str}.mp4")
+        dwt_out = os.path.join(output_dir, f"{video_name}_dwt3d_{br_str}.mp4")
 
         run_baseline_encoding(input_video, base_out, br_str)
+        run_dwt3d_encoding(input_video, dwt_out, br_str, threshold)
         run_proposed_encoding(input_video, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive)
         
         if include_spatial:
@@ -213,6 +269,7 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
 
         print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (VMAF 포함)...")
         b_p, b_s, b_v = evaluate_video_quality(input_video, base_out)
+        d_p, d_s, d_v = evaluate_video_quality(input_video, dwt_out)
         p_p, p_s, p_v = evaluate_video_quality(input_video, prop_out)
         
         if include_spatial:
@@ -223,22 +280,26 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
             s_p, s_v = 0.0, 0.0
 
         base_psnrs.append(b_p)
+        dwt_psnrs.append(d_p)
         prop_psnrs.append(p_p)
         base_vmafs.append(b_v)
+        dwt_vmafs.append(d_v)
         prop_vmafs.append(p_v)
 
         if include_spatial:
-            print(f"      -> PSNR: B({b_p:.2f}) vs P({p_p:.2f}) vs S({s_p:.2f}) | VMAF: B({b_v:.2f}) vs P({p_v:.2f}) vs S({s_v:.2f})\n")
+            print(f"      -> PSNR: B({b_p:.2f}) vs DWT({d_p:.2f}) vs DT({p_p:.2f}) vs S({s_p:.2f}) | VMAF: B({b_v:.2f}) vs DWT({d_v:.2f}) vs DT({p_v:.2f}) vs S({s_v:.2f})\n")
         else:
-            print(f"      -> PSNR: {b_p:.2f} vs {p_p:.2f} | VMAF: {b_v:.2f} vs {p_v:.2f}\n")
+            print(f"      -> PSNR: B({b_p:.2f}) vs DWT({d_p:.2f}) vs DT({p_p:.2f}) | VMAF: B({b_v:.2f}) vs DWT({d_v:.2f}) vs DT({p_v:.2f})\n")
 
     return {
         "video_name": video_name,
         "bitrates": bitrates,
         "base_psnrs": base_psnrs,
+        "dwt_psnrs": dwt_psnrs,
         "prop_psnrs": prop_psnrs,
         "spat_psnrs": spat_psnrs if include_spatial else None,
         "base_vmafs": base_vmafs,
+        "dwt_vmafs": dwt_vmafs,
         "prop_vmafs": prop_vmafs,
         "spat_vmafs": spat_vmafs if include_spatial else None,
     }
@@ -249,8 +310,10 @@ def report_and_save(result, output_dir):
     video_name = result["video_name"]
     bitrates = result["bitrates"]
     base_psnrs = result["base_psnrs"]
+    dwt_psnrs = result["dwt_psnrs"]
     prop_psnrs = result["prop_psnrs"]
     base_vmafs = result["base_vmafs"]
+    dwt_vmafs = result["dwt_vmafs"]
     prop_vmafs = result["prop_vmafs"]
 
     spat_psnrs = result.get("spat_psnrs")
@@ -271,29 +334,29 @@ def report_and_save(result, output_dir):
     with open(csv_filename, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if spat_psnrs:
-            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "Prop_PSNR", "Spat_PSNR",
-                             "Base_VMAF", "Prop_VMAF", "Spat_VMAF"])
-            for br, bp, pp, sp, bv, pv, sv in zip(
-                bitrates, base_psnrs, prop_psnrs, spat_psnrs, base_vmafs, prop_vmafs, spat_vmafs
+            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "DWT_PSNR", "Prop_PSNR", "Spat_PSNR",
+                             "Base_VMAF", "DWT_VMAF", "Prop_VMAF", "Spat_VMAF"])
+            for br, bp, dp, pp, sp, bv, dv, pv, sv in zip(
+                bitrates, base_psnrs, dwt_psnrs, prop_psnrs, spat_psnrs, base_vmafs, dwt_vmafs, prop_vmafs, spat_vmafs
             ):
-                writer.writerow([br, bp, pp, sp, bv, pv, sv])
+                writer.writerow([br, bp, dp, pp, sp, bv, dv, pv, sv])
         else:
-            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "Prop_PSNR",
-                             "Base_VMAF", "Prop_VMAF"])
-            for br, bp, pp, bv, pv in zip(
-                bitrates, base_psnrs, prop_psnrs, base_vmafs, prop_vmafs
+            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "DWT_PSNR", "Prop_PSNR",
+                             "Base_VMAF", "DWT_VMAF", "Prop_VMAF"])
+            for br, bp, dp, pp, bv, dv, pv in zip(
+                bitrates, base_psnrs, dwt_psnrs, prop_psnrs, base_vmafs, dwt_vmafs, prop_vmafs
             ):
-                writer.writerow([br, bp, pp, bv, pv])
+                writer.writerow([br, bp, dp, pp, bv, dv, pv])
 
     # RD Curve 생성
     plot_rd_curve(
-        bitrates, base_psnrs, prop_psnrs,
+        bitrates, base_psnrs, prop_psnrs, dwt_psnrs,
         title=f"PSNR RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_rate_psnr:.2f}%",
         filename=os.path.join(output_dir, f"rd_curve_psnr_{video_name}.png"),
         spatial_scores=spat_psnrs
     )
     plot_rd_curve(
-        bitrates, base_vmafs, prop_vmafs,
+        bitrates, base_vmafs, prop_vmafs, dwt_vmafs,
         title=f"VMAF RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_rate_vmaf:.2f}%",
         filename=os.path.join(output_dir, f"rd_curve_vmaf_{video_name}.png"),
         ylabel="VMAF Score",
