@@ -29,18 +29,26 @@ class DTCWT3DProcessor:
     CUDA 가용 시 자동으로 GPU 가속을 사용합니다.
     """
 
-    def __init__(self, threshold=0.03, nlevels=1, adaptive_threshold=True, use_coef_cache=True):
+    def __init__(self, threshold=0.03, nlevels=1, adaptive_threshold=True, use_coef_cache=True, target_bitrate_kbps=None):
         self.threshold = threshold
         self.nlevels = nlevels
         self.adaptive_threshold = adaptive_threshold
         self.use_coef_cache = use_coef_cache
+        self.target_bitrate_kbps = target_bitrate_kbps
         self.cached_Yl = None
         self.cached_Yh = None
+
+        # Rate-Adaptive Factor: 저비트레이트에서만 공격적 전처리
+        if target_bitrate_kbps is not None:
+            self.rate_factor = min(200.0 / target_bitrate_kbps, 1.0)
+        else:
+            self.rate_factor = 1.0
 
         if _USE_CUDA:
             self._cuda_proc = CudaDTCWT3DProcessor(
                 threshold=threshold, nlevels=nlevels, device='cuda',
-                adaptive_threshold=adaptive_threshold
+                adaptive_threshold=adaptive_threshold,
+                target_bitrate_kbps=target_bitrate_kbps
             )
             self._transform = None
         else:
@@ -72,6 +80,20 @@ class DTCWT3DProcessor:
         sigma = mad / 0.6745
         sigma_sq = sigma ** 2
         
+        # 2. 노이즈 게이트: σ_noise가 작으면 (깨끗한 영상) 임계값을 제곱 비율로 축소
+        # 제곱 곡선 사용으로 깨끗한 영상에서 더 공격적으로 감쇄
+        NOISE_GATE_THRESHOLD = 0.01
+        gate_ratio = min(sigma / NOISE_GATE_THRESHOLD, 1.0)
+        noise_gate_factor = gate_ratio ** 2  # 제곱 감쇄: σ=0.002 → factor≈0.04
+
+        # 최종 스케일링 팩터: noise_gate × rate_factor
+        total_scaling = noise_gate_factor * self.rate_factor
+
+        # 총 스케일링이 무시할 수준이면 전처리 바이패스 (None 반환)
+        # process_chunk에서 None을 감지하여 원본 입력을 그대로 반환
+        if total_scaling < 0.1:
+            return None
+        
         shrunk_levels = []
         for level_idx, hp in enumerate(highpasses):
             mag = np.abs(hp)
@@ -85,11 +107,14 @@ class DTCWT3DProcessor:
             base_factor = self.threshold * (2.0 ** level_idx)
             T_adapt = (sigma_sq / sigma_x) * base_factor
             
+            # 3. 최종 임계값: noise_gate × rate_factor 적용
+            T_final = T_adapt * noise_gate_factor * self.rate_factor
+            
             with np.errstate(divide='ignore', invalid='ignore'):
                 phase = hp / mag
                 phase[np.isnan(phase)] = 0.0
                 
-            shrunk_mag = np.maximum(mag - T_adapt, 0.0)
+            shrunk_mag = np.maximum(mag - T_final, 0.0)
             shrunk_levels.append(phase * shrunk_mag)
             
         return tuple(shrunk_levels)
@@ -108,16 +133,17 @@ class DTCWT3DProcessor:
             전처리된 (T, H, W) NumPy 배열. 값 범위 [0, 1].
         """
         orig_shape = chunk_numpy.shape
+        orig_input = chunk_numpy.copy()  # 바이패스 시 반환할 원본 보존
+
         pad_t = orig_shape[0] % 2
         pad_h = orig_shape[1] % 2
         pad_w = orig_shape[2] % 2
-        
+
         # 홀수 차원이 있을 경우 'symmetric' 모드로 패딩하여 짝수 크기로 맞춤
         if pad_t > 0 or pad_h > 0 or pad_w > 0:
-            # np.pad는 ((before_t, after_t), (before_h, after_h), (before_w, after_w)) 형식
             chunk_numpy = np.pad(
-                chunk_numpy, 
-                ((0, pad_t), (0, pad_h), (0, pad_w)), 
+                chunk_numpy,
+                ((0, pad_t), (0, pad_h), (0, pad_w)),
                 mode='symmetric'
             )
 
@@ -151,6 +177,10 @@ class DTCWT3DProcessor:
                 
                 Yh_shrunk = self._apply_shrinkage_cpu(Yh_full)
                 
+                # 바이패스 감지: shrinkage가 None을 반환하면 원본 반환
+                if Yh_shrunk is None:
+                    return orig_input
+                
                 import dtcwt
                 class TempPyr:
                     def __init__(self, l, h):
@@ -170,13 +200,24 @@ class DTCWT3DProcessor:
             if _USE_CUDA:
                 Yl_for_cache, Yh_for_cache = self._cuda_proc.forward(cube)
                 Yh_shrunk = self._cuda_proc.apply_shrinkage(Yh_for_cache)
+                
+                # 바이패스 감지
+                if Yh_shrunk is None:
+                    return orig_input
+                
                 reconstructed = self._cuda_proc.inverse(Yl_for_cache, Yh_shrunk)
                 res_np = reconstructed
             else:
                 pyramid = self._transform.forward(cube, nlevels=self.nlevels)
                 Yl_for_cache = pyramid.lowpass
                 Yh_for_cache = pyramid.highpasses
-                pyramid.highpasses = self._apply_shrinkage_cpu(pyramid.highpasses)
+                shrunk = self._apply_shrinkage_cpu(pyramid.highpasses)
+                
+                # 바이패스 감지
+                if shrunk is None:
+                    return orig_input
+                
+                pyramid.highpasses = shrunk
                 reconstructed = self._transform.inverse(pyramid)
                 res_np = reconstructed
                 

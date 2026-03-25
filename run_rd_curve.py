@@ -123,14 +123,15 @@ def run_dwt3d_encoding(input_video, output_video, bitrate, threshold=0.03, max_f
 
 
 def run_proposed_encoding(input_video, output_video, bitrate, threshold,
-                          max_frames=float('inf'), disable_overlap=False, disable_adaptive=False):
+                          max_frames=float('inf'), disable_overlap=False, disable_adaptive=False,
+                          target_bitrate_kbps=None):
     """3D DT-CWT 전처리를 거친 후 x264로 압축하는 제안 기법을 생성합니다."""
     print(f"  [Proposed] {bitrate} 전처리 및 인코딩 중 (T={threshold})...")
     w, h, fps = get_video_metadata(input_video)
     encoder_process = create_x264_encoder(output_video, w, h, fps, bitrate)
     
     adaptive = not disable_adaptive
-    processor = DTCWT3DProcessor(threshold=threshold, adaptive_threshold=adaptive)
+    processor = DTCWT3DProcessor(threshold=threshold, adaptive_threshold=adaptive, target_bitrate_kbps=target_bitrate_kbps)
 
     overlap_frames = 0 if disable_overlap else 4
     total_processed_frames = 0
@@ -237,7 +238,7 @@ def calculate_bd_psnr(R1, PSNR1, R2, PSNR2):
     return avg_diff
 
 
-def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False, visualize_frame=None):
+def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False, visualize_frame=None, noise_sigma=0):
     """단일 비디오에 대해 모든 비트레이트의 인코딩 + 평가를 수행합니다.
 
     이 함수는 ProcessPoolExecutor의 워커에서 호출되므로,
@@ -250,8 +251,23 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
     if not os.path.exists(input_video):
         return None
 
+    # 노이즈 주입: noise_sigma > 0이면 FFmpeg로 노이즈가 포함된 소스 생성
+    actual_input = input_video
+    noisy_path = None
+    if noise_sigma > 0:
+        noisy_path = os.path.join(output_dir, f"{video_name}_noisy_s{noise_sigma}.y4m")
+        if not os.path.exists(noisy_path):
+            print(f"  [노이즈] σ={noise_sigma} Gaussian 노이즈 주입 → {noisy_path}")
+            cmd = [
+                "ffmpeg", "-y", "-i", input_video,
+                "-vf", f"noise=alls={noise_sigma}:allf=t",
+                noisy_path,
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        actual_input = noisy_path
+
     print(f"\n{'=' * 50}")
-    print(f"  🎬 타겟 비디오: {video_name.upper()}")
+    print(f"  🎬 타겟 비디오: {video_name.upper()}" + (f" (σ_noise={noise_sigma})" if noise_sigma > 0 else ""))
     print(f"{'=' * 50}")
 
     base_psnrs, prop_psnrs, spat_psnrs, dwt_psnrs = [], [], [], []
@@ -270,12 +286,12 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
         spat_out = os.path.join(output_dir, f"{video_name}_spat_{br_str}.mp4")
         dwt_out = os.path.join(output_dir, f"{video_name}_dwt3d_{br_str}.mp4")
 
-        run_baseline_encoding(input_video, base_out, br_str)
-        run_dwt3d_encoding(input_video, dwt_out, br_str, threshold)
-        run_proposed_encoding(input_video, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive)
+        run_baseline_encoding(actual_input, base_out, br_str)
+        run_dwt3d_encoding(actual_input, dwt_out, br_str, threshold)
+        run_proposed_encoding(actual_input, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive, target_bitrate_kbps=br)
         
         if include_spatial:
-            run_spatial_encoding(input_video, spat_out, br_str)
+            run_spatial_encoding(actual_input, spat_out, br_str)
 
         print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (고급 지표 포함)...")
         b_p, b_s, b_v, b_ms, b_ep, b_pb, b_gb, b_me = evaluate_video_quality(input_video, base_out, num_frames_custom=60)
@@ -474,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable_adaptive_threshold", action="store_true", help="적응형 임계값 산출 로직 비활성화")
     parser.add_argument("--include_spatial", action="store_true", help="단순 2D 공간 필터(Gaussian) 비교군 포함")
     parser.add_argument("--visualize_frame", type=int, default=None, help="프레임 비교/에지/잔차 시각화를 수행할 특정 프레임 번호")
+    parser.add_argument("--noise_sigma", type=int, default=0, help="소스 비디오에 주입할 Gaussian 노이즈 σ (0=노이즈 없음, 예: 5, 10, 15, 20)")
     
     args = parser.parse_args()
 
@@ -492,7 +509,7 @@ if __name__ == "__main__":
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial, args.visualize_frame
+                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial, args.visualize_frame, args.noise_sigma
             ): name
             for name in VIDEO_NAMES
         }

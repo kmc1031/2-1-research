@@ -456,12 +456,20 @@ class CudaDTCWT3DProcessor:
 
     def __init__(self, threshold=0.03, nlevels=1, device='cuda',
                  adaptive_threshold=True,
-                 biort_name='near_sym_a', qshift_name='qshift_a'):
+                 biort_name='near_sym_a', qshift_name='qshift_a',
+                 target_bitrate_kbps=None):
         self.threshold = threshold
         self.nlevels = nlevels
         self.device = torch.device(device)
         self.ext_mode = 4
         self.adaptive_threshold = adaptive_threshold
+        self.target_bitrate_kbps = target_bitrate_kbps
+
+        # Rate-Adaptive Factor
+        if target_bitrate_kbps is not None:
+            self.rate_factor = min(200.0 / target_bitrate_kbps, 1.0)
+        else:
+            self.rate_factor = 1.0
 
         # 필터 계수 로딩 → PyTorch 텐서
         biort_coeffs = _biort(biort_name)
@@ -551,6 +559,17 @@ class CudaDTCWT3DProcessor:
         sigma = mad / 0.6745
         sigma_sq = sigma ** 2
         
+        # 2. 노이즈 게이트: σ_noise가 작으면 임계값을 제곱 비율로 축소
+        NOISE_GATE_THRESHOLD = 0.01
+        gate_ratio = min(sigma.item() / NOISE_GATE_THRESHOLD, 1.0)
+        noise_gate_factor = gate_ratio ** 2
+
+        total_scaling = noise_gate_factor * self.rate_factor
+
+        # 총 스케일링이 무시할 수준이면 전처리 바이패스 (None 반환)
+        if total_scaling < 0.1:
+            return None
+        
         shrunk_levels = []
         for level_idx, Yh in enumerate(highpasses):
             # Yh: (H, W, T, 28)
@@ -568,8 +587,11 @@ class CudaDTCWT3DProcessor:
             # T_adapt shape: (1, 1, 1, 28)
             T_adapt = (sigma_sq / sigma_x) * base_factor
             
+            # 3. 최종 임계값: noise_gate × rate_factor 적용
+            T_final = T_adapt * noise_gate_factor * self.rate_factor
+            
             phase = torch.where(mag > 0, Yh / mag, torch.zeros_like(Yh))
-            shrunk_mag = torch.clamp(mag - T_adapt, min=0.0)
+            shrunk_mag = torch.clamp(mag - T_final, min=0.0)
             
             shrunk_levels.append(phase * shrunk_mag)
             
