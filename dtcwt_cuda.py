@@ -544,8 +544,10 @@ class CudaDTCWT3DProcessor:
         finest_hps = highpasses[0]
         
         # 1. 전역 노이즈 분산 추정
-        finest_mag = torch.abs(finest_hps)
-        mad = torch.median(finest_mag)
+        # 복소수 magnitude는 Rayleigh 분포를 따르므로, Gaussian 가정의 MAD/0.6745가 성립하지 않음.
+        # 실수부만으로 MAD를 계산하여 정확한 σ_noise 추정.
+        finest_real = torch.real(finest_hps)
+        mad = torch.median(torch.abs(finest_real))
         sigma = mad / 0.6745
         sigma_sq = sigma ** 2
         

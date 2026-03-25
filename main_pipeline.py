@@ -237,17 +237,18 @@ if __name__ == "__main__":
         processed_y = processor.process_chunk(y_array, overlap_len=overlap_len)
 
         # 겹쳤던 부분(앞쪽 overlap_len 프레임)을 잘라내어 순수 새로운 프레임만 추출
-        processed_y_valid = processed_y[overlap_len:]
+        processed_y_valid = processed_y[overlap_len:overlap_len + frames_in_chunk]
 
         # [0, 1] float → [0, 255] uint8 변환
+        valid_frames = processed_y_valid.shape[0]
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
-        processed_y_flat = processed_y_uint8.reshape((frames_in_chunk, -1))
+        processed_y_flat = processed_y_uint8.reshape((valid_frames, -1))
         
         # U/V 채널 전처리 (크로마 노이즈 제거)
         u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
 
         # 인코더로 프레임 단위 쓰기 (Y + U + V)
-        for f in range(frames_in_chunk):
+        for f in range(valid_frames):
             encoder_process.stdin.write(processed_y_flat[f].tobytes())
             encoder_process.stdin.write(u_proc[f].tobytes())
             encoder_process.stdin.write(v_proc[f].tobytes())

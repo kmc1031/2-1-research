@@ -23,6 +23,9 @@ import subprocess
 from main_pipeline import get_video_metadata, read_y4m_and_split, create_x264_encoder
 from dtcwt_processor import DTCWT3DProcessor
 from evaluate_metrics import evaluate_video_quality
+from advanced_evaluation import _plot_advanced_chart
+from compare_frames import plot_comparison
+from edge_analysis import analyze_edges
 
 
 def run_baseline_encoding(input_video, output_video, bitrate):
@@ -137,23 +140,24 @@ def run_proposed_encoding(input_video, output_video, bitrate, threshold,
         if total_processed_frames >= max_frames:
             break
 
-        processed_y = processor.process_chunk(y_array)
+        processed_y = processor.process_chunk(y_array, overlap_len=overlap_len)
 
         # 겹쳤던 부분(앞쪽 overlap_len 프레임)을 잘라내어 순수 새로운 프레임만 추출
-        processed_y_valid = processed_y[overlap_len:]
+        processed_y_valid = processed_y[overlap_len:overlap_len + frames]
 
+        valid_frames = processed_y_valid.shape[0]
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
-        processed_y_flat = processed_y_uint8.reshape((frames, -1))
+        processed_y_flat = processed_y_uint8.reshape((valid_frames, -1))
         
         # U/V 채널 전처리 (크로마 노이즈 제거)
         u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
 
-        for f in range(frames):
+        for f in range(valid_frames):
             encoder_process.stdin.write(processed_y_flat[f].tobytes())
             encoder_process.stdin.write(u_proc[f].tobytes())
             encoder_process.stdin.write(v_proc[f].tobytes())
 
-        total_processed_frames += frames
+        total_processed_frames += valid_frames
 
     encoder_process.stdin.close()
     encoder_process.wait()
@@ -233,7 +237,7 @@ def calculate_bd_psnr(R1, PSNR1, R2, PSNR2):
     return avg_diff
 
 
-def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False):
+def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False, visualize_frame=None):
     """단일 비디오에 대해 모든 비트레이트의 인코딩 + 평가를 수행합니다.
 
     이 함수는 ProcessPoolExecutor의 워커에서 호출되므로,
@@ -251,7 +255,13 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
     print(f"{'=' * 50}")
 
     base_psnrs, prop_psnrs, spat_psnrs, dwt_psnrs = [], [], [], []
+    base_ssims, prop_ssims, spat_ssims, dwt_ssims = [], [], [], []
     base_vmafs, prop_vmafs, spat_vmafs, dwt_vmafs = [], [], [], []
+    base_msssims, prop_msssims, spat_msssims, dwt_msssims = [], [], [], []
+    base_epsnrs, prop_epsnrs, spat_epsnrs, dwt_epsnrs = [], [], [], []
+    base_psnrbs, prop_psnrbs, spat_psnrbs, dwt_psnrbs = [], [], [], []
+    base_gbims, prop_gbims, spat_gbims, dwt_gbims = [], [], [], []
+    base_meprs, prop_meprs, spat_meprs, dwt_meprs = [], [], [], []
 
     for br in bitrates:
         br_str = f"{br}k"
@@ -267,24 +277,46 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
         if include_spatial:
             run_spatial_encoding(input_video, spat_out, br_str)
 
-        print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (VMAF 포함)...")
-        b_p, b_s, b_v = evaluate_video_quality(input_video, base_out)
-        d_p, d_s, d_v = evaluate_video_quality(input_video, dwt_out)
-        p_p, p_s, p_v = evaluate_video_quality(input_video, prop_out)
+        print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (고급 지표 포함)...")
+        b_p, b_s, b_v, b_ms, b_ep, b_pb, b_gb, b_me = evaluate_video_quality(input_video, base_out, num_frames_custom=60)
+        d_p, d_s, d_v, d_ms, d_ep, d_pb, d_gb, d_me = evaluate_video_quality(input_video, dwt_out, num_frames_custom=60)
+        p_p, p_s, p_v, p_ms, p_ep, p_pb, p_gb, p_me = evaluate_video_quality(input_video, prop_out, num_frames_custom=60)
         
         if include_spatial:
-            s_p, s_s, s_v = evaluate_video_quality(input_video, spat_out)
-            spat_psnrs.append(s_p)
-            spat_vmafs.append(s_v)
+            s_p, s_s, s_v, s_ms, s_ep, s_pb, s_gb, s_me = evaluate_video_quality(input_video, spat_out, num_frames_custom=60)
+            spat_psnrs.append(s_p); spat_ssims.append(s_s); spat_vmafs.append(s_v); spat_msssims.append(s_ms)
+            spat_epsnrs.append(s_ep); spat_psnrbs.append(s_pb); spat_gbims.append(s_gb); spat_meprs.append(s_me)
         else:
             s_p, s_v = 0.0, 0.0
 
-        base_psnrs.append(b_p)
-        dwt_psnrs.append(d_p)
-        prop_psnrs.append(p_p)
-        base_vmafs.append(b_v)
-        dwt_vmafs.append(d_v)
-        prop_vmafs.append(p_v)
+        base_psnrs.append(b_p); base_ssims.append(b_s); base_vmafs.append(b_v); base_msssims.append(b_ms)
+        base_epsnrs.append(b_ep); base_psnrbs.append(b_pb); base_gbims.append(b_gb); base_meprs.append(b_me)
+        
+        dwt_psnrs.append(d_p); dwt_ssims.append(d_s); dwt_vmafs.append(d_v); dwt_msssims.append(d_ms)
+        dwt_epsnrs.append(d_ep); dwt_psnrbs.append(d_pb); dwt_gbims.append(d_gb); dwt_meprs.append(d_me)
+        
+        prop_psnrs.append(p_p); prop_ssims.append(p_s); prop_vmafs.append(p_v); prop_msssims.append(p_ms)
+        prop_epsnrs.append(p_ep); prop_psnrbs.append(p_pb); prop_gbims.append(p_gb); prop_meprs.append(p_me)
+
+        # Plot advanced chart for this bitrate
+        _plot_advanced_chart(
+            video_name, br_str,
+            b_ms, p_ms,
+            b_ep, p_ep,
+            b_pb, p_pb,
+            b_gb, p_gb,
+            b_me, p_me,
+            output_dir
+        )
+
+        if visualize_frame is not None:
+            import sys
+            plot_comparison(video_name, br_str, visualize_frame)
+            analyze_edges(video_name, br_str, visualize_frame)
+            subprocess.run([sys.executable, "visualize_residuals.py", "-o", input_video, "-p", prop_out, "-f", str(visualize_frame), 
+                            "--out", os.path.join(output_dir, f"residual_prop_{video_name}_{br_str}_f{visualize_frame}.png")], stdout=subprocess.DEVNULL)
+            subprocess.run([sys.executable, "visualize_residuals.py", "-o", input_video, "-p", base_out, "-f", str(visualize_frame), 
+                            "--out", os.path.join(output_dir, f"residual_base_{video_name}_{br_str}_f{visualize_frame}.png")], stdout=subprocess.DEVNULL)
 
         if include_spatial:
             print(f"      -> PSNR: B({b_p:.2f}) vs DWT({d_p:.2f}) vs DT({p_p:.2f}) vs S({s_p:.2f}) | VMAF: B({b_v:.2f}) vs DWT({d_v:.2f}) vs DT({p_v:.2f}) vs S({s_v:.2f})\n")
@@ -292,32 +324,49 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
             print(f"      -> PSNR: B({b_p:.2f}) vs DWT({d_p:.2f}) vs DT({p_p:.2f}) | VMAF: B({b_v:.2f}) vs DWT({d_v:.2f}) vs DT({p_v:.2f})\n")
 
     return {
-        "video_name": video_name,
-        "bitrates": bitrates,
-        "base_psnrs": base_psnrs,
-        "dwt_psnrs": dwt_psnrs,
-        "prop_psnrs": prop_psnrs,
-        "spat_psnrs": spat_psnrs if include_spatial else None,
-        "base_vmafs": base_vmafs,
-        "dwt_vmafs": dwt_vmafs,
-        "prop_vmafs": prop_vmafs,
-        "spat_vmafs": spat_vmafs if include_spatial else None,
+        "video_name": video_name, "bitrates": bitrates,
+        "base_psnrs": base_psnrs, "dwt_psnrs": dwt_psnrs, "prop_psnrs": prop_psnrs, "spat_psnrs": spat_psnrs if include_spatial else None,
+        "base_ssims": base_ssims, "dwt_ssims": dwt_ssims, "prop_ssims": prop_ssims, "spat_ssims": spat_ssims if include_spatial else None,
+        "base_vmafs": base_vmafs, "dwt_vmafs": dwt_vmafs, "prop_vmafs": prop_vmafs, "spat_vmafs": spat_vmafs if include_spatial else None,
+        "base_msssims": base_msssims, "dwt_msssims": dwt_msssims, "prop_msssims": prop_msssims, "spat_msssims": spat_msssims if include_spatial else None,
+        "base_epsnrs": base_epsnrs, "dwt_epsnrs": dwt_epsnrs, "prop_epsnrs": prop_epsnrs, "spat_epsnrs": spat_epsnrs if include_spatial else None,
+        "base_psnrbs": base_psnrbs, "dwt_psnrbs": dwt_psnrbs, "prop_psnrbs": prop_psnrbs, "spat_psnrbs": spat_psnrbs if include_spatial else None,
+        "base_gbims": base_gbims, "dwt_gbims": dwt_gbims, "prop_gbims": prop_gbims, "spat_gbims": spat_gbims if include_spatial else None,
+        "base_meprs": base_meprs, "dwt_meprs": dwt_meprs, "prop_meprs": prop_meprs, "spat_meprs": spat_meprs if include_spatial else None,
     }
+
+
+def _safe(values):
+    """None 값을 0.0으로 치환하여 BD-Rate 계산 시 크래시를 방지합니다."""
+    return [v if v is not None else 0.0 for v in values]
 
 
 def report_and_save(result, output_dir):
     """단일 비디오의 결과를 출력하고, CSV 및 RD Curve를 저장합니다."""
     video_name = result["video_name"]
     bitrates = result["bitrates"]
-    base_psnrs = result["base_psnrs"]
-    dwt_psnrs = result["dwt_psnrs"]
-    prop_psnrs = result["prop_psnrs"]
-    base_vmafs = result["base_vmafs"]
-    dwt_vmafs = result["dwt_vmafs"]
-    prop_vmafs = result["prop_vmafs"]
+    base_psnrs = _safe(result["base_psnrs"])
+    dwt_psnrs = _safe(result["dwt_psnrs"])
+    prop_psnrs = _safe(result["prop_psnrs"])
+    base_ssims = _safe(result["base_ssims"]); dwt_ssims = _safe(result["dwt_ssims"]); prop_ssims = _safe(result["prop_ssims"])
+    base_vmafs = _safe(result["base_vmafs"])
+    dwt_vmafs = _safe(result["dwt_vmafs"])
+    prop_vmafs = _safe(result["prop_vmafs"])
+    
+    base_msssims = _safe(result["base_msssims"]); dwt_msssims = _safe(result["dwt_msssims"]); prop_msssims = _safe(result["prop_msssims"])
+    base_epsnrs = _safe(result["base_epsnrs"]); dwt_epsnrs = _safe(result["dwt_epsnrs"]); prop_epsnrs = _safe(result["prop_epsnrs"])
+    base_psnrbs = _safe(result["base_psnrbs"]); dwt_psnrbs = _safe(result["dwt_psnrbs"]); prop_psnrbs = _safe(result["prop_psnrbs"])
+    base_gbims = _safe(result["base_gbims"]); dwt_gbims = _safe(result["dwt_gbims"]); prop_gbims = _safe(result["prop_gbims"])
+    base_meprs = _safe(result["base_meprs"]); dwt_meprs = _safe(result["dwt_meprs"]); prop_meprs = _safe(result["prop_meprs"])
 
-    spat_psnrs = result.get("spat_psnrs")
-    spat_vmafs = result.get("spat_vmafs")
+    spat_psnrs = _safe(result["spat_psnrs"]) if result.get("spat_psnrs") else None
+    spat_ssims = _safe(result["spat_ssims"]) if result.get("spat_ssims") else None
+    spat_vmafs = _safe(result["spat_vmafs"]) if result.get("spat_vmafs") else None
+    spat_msssims = _safe(result["spat_msssims"]) if result.get("spat_msssims") else None
+    spat_epsnrs = _safe(result["spat_epsnrs"]) if result.get("spat_epsnrs") else None
+    spat_psnrbs = _safe(result["spat_psnrbs"]) if result.get("spat_psnrbs") else None
+    spat_gbims = _safe(result["spat_gbims"]) if result.get("spat_gbims") else None
+    spat_meprs = _safe(result["spat_meprs"]) if result.get("spat_meprs") else None
 
     # BD-Rate 계산
     bd_rate_psnr = calculate_bd_rate(bitrates, base_psnrs, bitrates, prop_psnrs)
@@ -334,19 +383,65 @@ def report_and_save(result, output_dir):
     with open(csv_filename, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if spat_psnrs:
-            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "DWT_PSNR", "Prop_PSNR", "Spat_PSNR",
-                             "Base_VMAF", "DWT_VMAF", "Prop_VMAF", "Spat_VMAF"])
-            for br, bp, dp, pp, sp, bv, dv, pv, sv in zip(
-                bitrates, base_psnrs, dwt_psnrs, prop_psnrs, spat_psnrs, base_vmafs, dwt_vmafs, prop_vmafs, spat_vmafs
+            writer.writerow([
+                "Bitrate(kbps)", "Base_PSNR", "DWT_PSNR", "Prop_PSNR", "Spat_PSNR",
+                "Base_SSIM", "DWT_SSIM", "Prop_SSIM", "Spat_SSIM",
+                "Base_VMAF", "DWT_VMAF", "Prop_VMAF", "Spat_VMAF",
+                "Base_MSSSIM", "DWT_MSSSIM", "Prop_MSSSIM", "Spat_MSSSIM",
+                "Base_EPSNR", "DWT_EPSNR", "Prop_EPSNR", "Spat_EPSNR",
+                "Base_PSNRB", "DWT_PSNRB", "Prop_PSNRB", "Spat_PSNRB",
+                "Base_GBIM", "DWT_GBIM", "Prop_GBIM", "Spat_GBIM",
+                "Base_MEPR", "DWT_MEPR", "Prop_MEPR", "Spat_MEPR"
+            ])
+            for (
+                br, bp, dp, pp, sp, bss, dss, pss, sss, bv, dv, pv, sv,
+                bms, dms, pms, sms, bep, dep, pep, sep,
+                bpb, dpb, ppb, spb, bgb, dgb, pgb, sgb, bme, dme, pme, sme
+            ) in zip(
+                bitrates, base_psnrs, dwt_psnrs, prop_psnrs, spat_psnrs,
+                base_ssims, dwt_ssims, prop_ssims, spat_ssims,
+                base_vmafs, dwt_vmafs, prop_vmafs, spat_vmafs,
+                base_msssims, dwt_msssims, prop_msssims, spat_msssims,
+                base_epsnrs, dwt_epsnrs, prop_epsnrs, spat_epsnrs,
+                base_psnrbs, dwt_psnrbs, prop_psnrbs, spat_psnrbs,
+                base_gbims, dwt_gbims, prop_gbims, spat_gbims,
+                base_meprs, dwt_meprs, prop_meprs, spat_meprs
             ):
-                writer.writerow([br, bp, dp, pp, sp, bv, dv, pv, sv])
+                writer.writerow([
+                    br, bp, dp, pp, sp, bss, dss, pss, sss, bv, dv, pv, sv,
+                    bms, dms, pms, sms, bep, dep, pep, sep,
+                    bpb, dpb, ppb, spb, bgb, dgb, pgb, sgb, bme, dme, pme, sme
+                ])
         else:
-            writer.writerow(["Bitrate(kbps)", "Base_PSNR", "DWT_PSNR", "Prop_PSNR",
-                             "Base_VMAF", "DWT_VMAF", "Prop_VMAF"])
-            for br, bp, dp, pp, bv, dv, pv in zip(
-                bitrates, base_psnrs, dwt_psnrs, prop_psnrs, base_vmafs, dwt_vmafs, prop_vmafs
+            writer.writerow([
+                "Bitrate(kbps)", "Base_PSNR", "DWT_PSNR", "Prop_PSNR",
+                "Base_SSIM", "DWT_SSIM", "Prop_SSIM",
+                "Base_VMAF", "DWT_VMAF", "Prop_VMAF",
+                "Base_MSSSIM", "DWT_MSSSIM", "Prop_MSSSIM",
+                "Base_EPSNR", "DWT_EPSNR", "Prop_EPSNR",
+                "Base_PSNRB", "DWT_PSNRB", "Prop_PSNRB",
+                "Base_GBIM", "DWT_GBIM", "Prop_GBIM",
+                "Base_MEPR", "DWT_MEPR", "Prop_MEPR"
+            ])
+            for (
+                br, bp, dp, pp, bss, dss, pss, bv, dv, pv,
+                bms, dms, pms, bep, dep, pep,
+                bpb, dpb, ppb, bgb, dgb, pgb, bme, dme, pme
+            ) in zip(
+                bitrates, base_psnrs, dwt_psnrs, prop_psnrs,
+                base_ssims, dwt_ssims, prop_ssims,
+                base_vmafs, dwt_vmafs, prop_vmafs,
+                base_msssims, dwt_msssims, prop_msssims,
+                base_epsnrs, dwt_epsnrs, prop_epsnrs,
+                base_psnrbs, dwt_psnrbs, prop_psnrbs,
+                base_gbims, dwt_gbims, prop_gbims,
+                base_meprs, dwt_meprs, prop_meprs
             ):
-                writer.writerow([br, bp, dp, pp, bv, dv, pv])
+                writer.writerow([
+                    br, bp, dp, pp, bss, dss, pss, bv, dv, pv,
+                    bms, dms, pms, bep, dep, pep,
+                    bpb, dpb, ppb, bgb, dgb, pgb, bme, dme, pme
+                ])
 
     # RD Curve 생성
     plot_rd_curve(
@@ -378,6 +473,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable_overlap", action="store_true", help="오버랩 방식 블록 기반 처리 비활성화")
     parser.add_argument("--disable_adaptive_threshold", action="store_true", help="적응형 임계값 산출 로직 비활성화")
     parser.add_argument("--include_spatial", action="store_true", help="단순 2D 공간 필터(Gaussian) 비교군 포함")
+    parser.add_argument("--visualize_frame", type=int, default=None, help="프레임 비교/에지/잔차 시각화를 수행할 특정 프레임 번호")
     
     args = parser.parse_args()
 
@@ -396,7 +492,7 @@ if __name__ == "__main__":
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial
+                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial, args.visualize_frame
             ): name
             for name in VIDEO_NAMES
         }

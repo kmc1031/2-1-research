@@ -65,8 +65,10 @@ class DTCWT3DProcessor:
         finest_hps = highpasses[0]
         
         # 1. 전역 노이즈 분산 추정
-        finest_mag = np.abs(finest_hps)
-        mad = np.median(finest_mag)
+        # 복소수 magnitude는 Rayleigh 분포를 따르므로, Gaussian 가정의 MAD/0.6745가 성립하지 않음.
+        # 실수부(또는 허수부)만으로 MAD를 계산하여 정확한 σ_noise 추정.
+        finest_real = np.real(finest_hps)
+        mad = np.median(np.abs(finest_real))
         sigma = mad / 0.6745
         sigma_sq = sigma ** 2
         
@@ -224,20 +226,26 @@ class DTCWT3DProcessor:
         u_cube = u_flat.reshape((frames, ch, cw)).astype(np.float32) / 255.0
         v_cube = v_flat.reshape((frames, ch, cw)).astype(np.float32) / 255.0
         
+        # Y 채널 캐시를 백업 (Chroma 처리가 캐시를 오염시키는 것을 방지)
+        saved_Yl = self.cached_Yl
+        saved_Yh = self.cached_Yh
+        
         # 색상 채널은 좀 더 강하게 컷오프하기 위해 threshold 임시 1.5배 증가
         orig_thresh = self.threshold
         self.threshold = orig_thresh * 1.5
         if _USE_CUDA:
             self._cuda_proc.threshold = orig_thresh * 1.5
             
-        # 3D DT-CWT 적용
-        u_proc = self.process_chunk(u_cube)
-        v_proc = self.process_chunk(v_cube)
+        # 3D DT-CWT 적용 (overlap_len=0으로 호출하여 캐시 업데이트 방지)
+        u_proc = self.process_chunk(u_cube, overlap_len=0)
+        v_proc = self.process_chunk(v_cube, overlap_len=0)
         
-        # threshold 복구
+        # threshold 복구 및 Y 채널 캐시 복원
         self.threshold = orig_thresh
         if _USE_CUDA:
             self._cuda_proc.threshold = orig_thresh
+        self.cached_Yl = saved_Yl
+        self.cached_Yh = saved_Yh
             
         # uint8 변환 및 1D 평면 포맷(flat)으로 복구
         u_out = (np.clip(u_proc, 0.0, 1.0) * 255.0).astype(np.uint8).reshape((frames, -1))

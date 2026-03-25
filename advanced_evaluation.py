@@ -51,7 +51,7 @@ def extract_ms_ssim_vmaf(ref_video, dist_video):
 
 
 def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
-    """프레임 단위로 EPSNR, PSNR-B, GBIM, Temporal STRRED를 계산합니다.
+    """프레임 단위로 EPSNR, PSNR-B, GBIM, MEPR을 계산합니다.
 
     Args:
         ref_cap: 원본 비디오의 cv2.VideoCapture 객체.
@@ -59,9 +59,9 @@ def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
         num_frames: 분석할 프레임 수.
 
     Returns:
-        (epsnr_mean, psnrb_mean, gbim_mean, strred_mean) 튜플.
+        (epsnr_mean, psnrb_mean, gbim_mean, mepr_mean) 튜플.
     """
-    epsnr_list, psnrb_list, gbim_list, strred_proxy_list = [], [], [], []
+    epsnr_list, psnrb_list, gbim_list, mepr_list = [], [], [], []
     prev_ref_gray = None
     prev_dist_gray = None
 
@@ -95,23 +95,28 @@ def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
         gbim_val = (np.mean(diff_h) + np.mean(diff_v)) / 2.0
         gbim_list.append(gbim_val)
 
-        # PSNR-B: 경계 블로킹 에러를 포함한 보정 MSE
+        # PSNR-B (Yim & Bovik, 2011): 블록 경계의 blocking effect를 분리하여 보정
         mse_total = np.mean((ref_gray - dist_gray)**2)
-        mse_boundary = (
-            np.mean((ref_gray[:, col_edges] - dist_gray[:, col_edges])**2)
-            + np.mean((ref_gray[row_edges, :] - dist_gray[row_edges, :])**2)
-        ) / 2.0
-        mse_b = mse_total + max(0, mse_boundary - mse_total)
+        
+        block_diff_h = np.mean((dist_gray[:, col_edges] - dist_gray[:, col_edges + 1])**2)
+        block_diff_v = np.mean((dist_gray[row_edges, :] - dist_gray[row_edges + 1, :])**2)
+        blocking_effect = (block_diff_h + block_diff_v) / 2.0
+        
+        ref_diff_h = np.mean((ref_gray[:, col_edges] - ref_gray[:, col_edges + 1])**2)
+        ref_diff_v = np.mean((ref_gray[row_edges, :] - ref_gray[row_edges + 1, :])**2)
+        natural_edge = (ref_diff_h + ref_diff_v) / 2.0
+        
+        added_blocking = max(0, blocking_effect - natural_edge)
+        mse_b = mse_total + added_blocking
         psnrb = 10 * np.log10((MAX_PIXEL_VALUE**2) / (mse_b + 1e-10))
         psnrb_list.append(psnrb)
 
-        # --- 3. STRRED (Spatio-Temporal Proxy) ---
+        # --- 3. MEPR (Motion Energy Preservation Ratio) ---
         if prev_ref_gray is not None:
             mot_ref = np.mean(np.abs(ref_gray - prev_ref_gray))
             mot_dist = np.mean(np.abs(dist_gray - prev_dist_gray))
-            # 모션 에너지 보존율 (1에 가까울수록 원본 모션 완벽 보존)
-            strred_proxy = min(mot_dist, mot_ref) / (max(mot_dist, mot_ref) + 1e-10)
-            strred_proxy_list.append(strred_proxy)
+            mepr = min(mot_dist, mot_ref) / (max(mot_dist, mot_ref) + 1e-10)
+            mepr_list.append(mepr)
 
         prev_ref_gray = ref_gray
         prev_dist_gray = dist_gray
@@ -120,7 +125,7 @@ def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
         np.mean(epsnr_list),
         np.mean(psnrb_list),
         np.mean(gbim_list),
-        np.mean(strred_proxy_list) if strred_proxy_list else 0
+        np.mean(mepr_list) if mepr_list else 0
     )
 
 
@@ -151,7 +156,7 @@ def evaluate_and_plot_advanced(video_name, bitrate):
     # 2. Pixel & Block 기반 지표 측정
     cap_ref1 = cv2.VideoCapture(ref_vid)
     cap_base = cv2.VideoCapture(base_vid)
-    epsnr_b, psnrb_b, gbim_b, strred_b = compute_custom_metrics(
+    epsnr_b, psnrb_b, gbim_b, mepr_b = compute_custom_metrics(
         cap_ref1, cap_base, num_frames=60
     )
     cap_ref1.release()
@@ -159,7 +164,7 @@ def evaluate_and_plot_advanced(video_name, bitrate):
 
     cap_ref2 = cv2.VideoCapture(ref_vid)
     cap_prop = cv2.VideoCapture(prop_vid)
-    epsnr_p, psnrb_p, gbim_p, strred_p = compute_custom_metrics(
+    epsnr_p, psnrb_p, gbim_p, mepr_p = compute_custom_metrics(
         cap_ref2, cap_prop, num_frames=60
     )
     cap_ref2.release()
@@ -172,7 +177,7 @@ def evaluate_and_plot_advanced(video_name, bitrate):
     print(f"  2. EPSNR   (높을수록 좋음) : Base {epsnr_b:.2f} vs Prop {epsnr_p:.2f}")
     print(f"  3. PSNR-B  (높을수록 좋음) : Base {psnrb_b:.2f} vs Prop {psnrb_p:.2f}")
     print(f"  4. GBIM    (낮을수록 좋음) : Base {gbim_b:.2f} vs Prop {gbim_p:.2f}")
-    print(f"  5. STRRED* (1에 가까울수록) : Base {strred_b:.4f} vs Prop {strred_p:.4f}")
+    print(f"  5. MEPR    (1에 가까울수록) : Base {mepr_b:.4f} vs Prop {mepr_p:.4f}")
     print("-" * 50)
 
     # --- 시각화 ---
@@ -182,7 +187,7 @@ def evaluate_and_plot_advanced(video_name, bitrate):
         epsnr_b, epsnr_p,
         psnrb_b, psnrb_p,
         gbim_b, gbim_p,
-        strred_b, strred_p,
+        mepr_b, mepr_p,
         base_dir,
     )
 
@@ -195,7 +200,7 @@ def _plot_advanced_chart(video_name, bitrate,
                          strred_b, strred_p,
                          base_dir):
     """고급 지표 비교 막대 그래프를 생성합니다."""
-    metrics_higher = ['MS-SSIM', 'EPSNR (dB)', 'PSNR-B (dB)', 'Temporal STRRED']
+    metrics_higher = ['MS-SSIM', 'EPSNR (dB)', 'PSNR-B (dB)', 'MEPR']
     base_high = [ms_ssim_base, epsnr_b, psnrb_b, strred_b]
     prop_high = [ms_ssim_prop, epsnr_p, psnrb_p, strred_p]
 
@@ -258,4 +263,4 @@ def _plot_advanced_chart(video_name, bitrate,
 
 
 if __name__ == "__main__":
-    evaluate_and_plot_advanced("mobile", "200k")
+    evaluate_and_plot_advanced("stefan", "200k")
