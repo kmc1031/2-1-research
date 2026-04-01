@@ -42,6 +42,72 @@ def run_baseline_encoding(input_video, output_video, bitrate):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def run_nr_encoding(input_video, output_video, bitrate, nr_strength=100):
+    """x264 내장 --nr (Noise Reduction) 옵션을 사용하는 비교군을 생성합니다.
+
+    x264의 --nr 옵션은 DCT 계수에 직접 노이즈 저감을 적용합니다.
+    이는 frequency-domain 방식으로, 외부 전처리 없이 코덱 내부에서 처리합니다.
+
+    Args:
+        input_video: 입력 비디오 경로.
+        output_video: 출력 비디오 경로.
+        bitrate: 목표 비트레이트 (예: "200k").
+        nr_strength: --nr 강도. 0~65536, 기본 100. 값이 클수록 더 강한 노이즈 저감.
+    """
+    print(f"  [NR]      {bitrate} 인코딩 중 (x264 --nr={nr_strength})...")
+    cmd = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-vcodec", "libx264",
+        "-b:v", bitrate,
+        "-preset", "fast",
+        "-tune", "zerolatency",
+        # x264의 DCT 도메인 노이즈 제거 옵션
+        "-x264opts", f"nr={nr_strength}",
+        output_video,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run_hqdn3d_encoding(input_video, output_video, bitrate,
+                         luma_spatial=4.0, luma_temporal=3.0,
+                         chroma_spatial=3.0, chroma_temporal=2.5):
+    """FFmpeg hqdn3d 시공간 디노이저를 전처리로 사용하는 비교군을 생성합니다.
+
+    hqdn3d(High Quality 3D Denoiser)는 FFmpeg의 표준 시공간 저역통과 필터입니다.
+    NLMeans와 달리 매우 빠르며, 방송/스트리밍에서 표준적으로 사용됩니다.
+
+    파라미터 가이드:
+        luma_spatial: 공간 축 루마 노이즈 제거 강도 (권장: 2~6)
+        luma_temporal: 시간 축 루마 노이즈 제거 강도 (권장: 2~4)
+        chroma_*: 크로마 채널 강도 (보통 루마보다 약하게 설정)
+
+    Args:
+        input_video: 입력 비디오 경로.
+        output_video: 출력 비디오 경로.
+        bitrate: 목표 비트레이트.
+        luma_spatial: Luma 공간 강도.
+        luma_temporal: Luma 시간 강도.
+        chroma_spatial: Chroma 공간 강도.
+        chroma_temporal: Chroma 시간 강도.
+    """
+    print(f"  [hqdn3d]  {bitrate} 인코딩 중 "
+          f"(ls={luma_spatial},lt={luma_temporal},cs={chroma_spatial},ct={chroma_temporal})...")
+    hqdn3d_filter = (
+        f"hqdn3d={luma_spatial}:{chroma_spatial}:{luma_temporal}:{chroma_temporal}"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-vf", hqdn3d_filter,
+        "-vcodec", "libx264",
+        "-b:v", bitrate,
+        "-preset", "fast",
+        "-tune", "zerolatency",
+        output_video,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+
 def run_spatial_encoding(input_video, output_video, bitrate, max_frames=float('inf')):
     """단순 2D 공간 필터(Gaussian Blur)를 적용한 후 x264로 압축하는 비교군을 생성합니다."""
     print(f"  [Spatial] {bitrate} 전처리 및 인코딩 중 (Gaussian Blur)...")

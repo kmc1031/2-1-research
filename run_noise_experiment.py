@@ -38,6 +38,7 @@ from dtcwt_processor import DTCWT3DProcessor
 from evaluate_metrics import evaluate_video_quality
 from run_rd_curve import (
     run_baseline_encoding, run_proposed_encoding, run_dwt3d_encoding,
+    run_nr_encoding, run_hqdn3d_encoding,
     calculate_bd_rate, calculate_bd_psnr, _safe,
 )
 
@@ -114,10 +115,20 @@ def create_noisy_video(input_path, output_path, sigma, seed=42):
 
 METRIC_NAMES = ['psnr', 'ssim', 'vmaf', 'msssim', 'epsnr', 'psnrb', 'gbim', 'mepr']
 
+# 사용 가능한 비교군 키 → (표시명, 인코더 함수 or None(=Proposed))
+ALL_BASELINES = {
+    'base':   ('Baseline (x264)',        run_baseline_encoding),
+    'nr':     ('x264 --nr',              run_nr_encoding),
+    'hqdn3d': ('FFmpeg hqdn3d',          run_hqdn3d_encoding),
+    'dwt':    ('3D DWT + x264',          run_dwt3d_encoding),
+    'prop':   ('3D DT-CWT (Proposed)',   None),   # 항상 포함
+}
+DEFAULT_BASELINES = ['base', 'dwt']   # 기본 실행 비교군 (prop은 항상 포함)
+
 
 def run_single_condition(video_name, clean_video, input_video, sigma,
-                         output_dir, bitrates, threshold):
-    """단일 노이즈 조건에서 Baseline/Proposed/DWT 실험을 수행합니다.
+                         output_dir, bitrates, threshold, baselines=None):
+    """단일 노이즈 조건에서 여러 비교군과 Proposed의 실험을 수행합니다.
 
     Args:
         video_name: 비디오 이름 (확장자 제외).
@@ -127,52 +138,72 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
         output_dir: 출력 디렉토리.
         bitrates: 비트레이트 목록 (kbps 정수).
         threshold: DT-CWT 임계값.
+        baselines: 포함할 비교군 키 목록. None이면 DEFAULT_BASELINES 사용.
+                   사용 가능: 'base', 'nr', 'hqdn3d', 'dwt'  (prop은 항상 포함)
 
     Returns:
         결과 딕셔너리.
     """
+    if baselines is None:
+        baselines = DEFAULT_BASELINES
+    # prop은 항상 포함, 중복 제거
+    active_methods = list(dict.fromkeys(baselines + ['prop']))
+
     condition = "Clean" if sigma == 0 else f"σ={sigma}"
     print(f"\n{'=' * 60}")
     print(f"  🎬 {video_name.upper()} | 조건: {condition}")
+    print(f"  비교군: {[ALL_BASELINES[m][0] for m in active_methods]}")
     print(f"{'=' * 60}")
 
     results = {
         'video': video_name, 'sigma': sigma, 'bitrates': bitrates,
-        'base': {m: [] for m in METRIC_NAMES},
-        'prop': {m: [] for m in METRIC_NAMES},
-        'dwt':  {m: [] for m in METRIC_NAMES},
+        'active_methods': active_methods,
     }
+    for method_key in active_methods:
+        results[method_key] = {metric: [] for metric in METRIC_NAMES}
 
     for br in bitrates:
         br_str = f"{br}k"
         prefix = f"{video_name}_s{sigma}"
 
-        base_out = os.path.join(output_dir, f"{prefix}_base_{br_str}.mp4")
-        prop_out = os.path.join(output_dir, f"{prefix}_prop_{br_str}.mp4")
-        dwt_out  = os.path.join(output_dir, f"{prefix}_dwt3d_{br_str}.mp4")
+        # 출력 파일 경로 결정
+        output_paths = {
+            method_key: os.path.join(output_dir, f"{prefix}_{method_key}_{br_str}.mp4")
+            for method_key in active_methods
+        }
 
         # --- 인코딩 ---
-        run_baseline_encoding(input_video, base_out, br_str)
-        run_dwt3d_encoding(input_video, dwt_out, br_str, threshold)
-        run_proposed_encoding(input_video, prop_out, br_str, threshold)
+        for method_key in active_methods:
+            out_path = output_paths[method_key]
+            if method_key == 'base':
+                run_baseline_encoding(input_video, out_path, br_str)
+            elif method_key == 'nr':
+                run_nr_encoding(input_video, out_path, br_str)
+            elif method_key == 'hqdn3d':
+                run_hqdn3d_encoding(input_video, out_path, br_str)
+            elif method_key == 'dwt':
+                run_dwt3d_encoding(input_video, out_path, br_str, threshold)
+            elif method_key == 'prop':
+                run_proposed_encoding(input_video, out_path, br_str, threshold)
 
         # --- 품질 평가 (참조 = 항상 clean 원본!) ---
         print(f"  [평가] {condition} - {br_str} (참조: clean 원본)")
-        b_metrics = evaluate_video_quality(clean_video, base_out, num_frames_custom=60)
-        d_metrics = evaluate_video_quality(clean_video, dwt_out, num_frames_custom=60)
-        p_metrics = evaluate_video_quality(clean_video, prop_out, num_frames_custom=60)
+        for method_key in active_methods:
+            m_result = evaluate_video_quality(
+                clean_video, output_paths[method_key], num_frames_custom=60
+            )
+            for i, name in enumerate(METRIC_NAMES):
+                results[method_key][name].append(m_result[i])
 
-        for i, name in enumerate(METRIC_NAMES):
-            results['base'][name].append(b_metrics[i])
-            results['prop'][name].append(p_metrics[i])
-            results['dwt'][name].append(d_metrics[i])
-
-        b_p, p_p, d_p = b_metrics[0], p_metrics[0], d_metrics[0]
-        b_v, p_v, d_v = b_metrics[2], p_metrics[2], d_metrics[2]
-        print(f"    PSNR: B({_fmt(b_p)}) vs DWT({_fmt(d_p)}) vs DT({_fmt(p_p)}) "
-              f"| VMAF: B({_fmt(b_v)}) vs DWT({_fmt(d_v)}) vs DT({_fmt(p_v)})")
+        # 콘솔 PSNR 요약
+        psnr_parts = [
+            f"{ALL_BASELINES[m][0].split()[0]}({_fmt(results[m]['psnr'][-1])})"
+            for m in active_methods
+        ]
+        print(f"    PSNR: {' | '.join(psnr_parts)}")
 
     return results
+
 
 
 def _fmt(v):
@@ -187,52 +218,68 @@ def _fmt(v):
 # ============================================================================
 
 def compute_condition_summary(results):
-    """단일 조건의 BD-Rate/BD-PSNR을 계산합니다."""
+    """단일 조건의 BD-Rate/BD-PSNR을 계산합니다.
+
+    항상 'prop' vs 'base' 기준으로 BD-Rate를 계산합니다.
+    'dwt', 'nr', 'hqdn3d'는 존재할 경우 추가로 계산합니다.
+    """
     bitrates = results['bitrates']
+    active = results.get('active_methods', ['base', 'dwt', 'prop'])
+    nan_list = [float('nan')] * len(bitrates)
 
-    base_psnrs = _safe(results['base']['psnr'])
-    prop_psnrs = _safe(results['prop']['psnr'])
-    dwt_psnrs  = _safe(results['dwt']['psnr'])
+    base_psnrs = _safe(results['base']['psnr']) if 'base' in active else nan_list
+    prop_psnrs = _safe(results['prop']['psnr']) if 'prop' in active else nan_list
+    base_vmafs = _safe(results['base']['vmaf']) if 'base' in active else nan_list
+    prop_vmafs = _safe(results['prop']['vmaf']) if 'prop' in active else nan_list
 
-    base_vmafs = _safe(results['base']['vmaf'])
-    prop_vmafs = _safe(results['prop']['vmaf'])
-    dwt_vmafs  = _safe(results['dwt']['vmaf'])
-
-    return {
+    summary = {
         'bd_rate_psnr_prop': calculate_bd_rate(bitrates, base_psnrs, bitrates, prop_psnrs),
         'bd_rate_vmaf_prop': calculate_bd_rate(bitrates, base_vmafs, bitrates, prop_vmafs),
-        'bd_rate_psnr_dwt':  calculate_bd_rate(bitrates, base_psnrs, bitrates, dwt_psnrs),
-        'bd_rate_vmaf_dwt':  calculate_bd_rate(bitrates, base_vmafs, bitrates, dwt_vmafs),
-        'bd_psnr_prop': calculate_bd_psnr(bitrates, base_psnrs, bitrates, prop_psnrs),
-        'bd_psnr_dwt':  calculate_bd_psnr(bitrates, base_psnrs, bitrates, dwt_psnrs),
+        'bd_psnr_prop':      calculate_bd_psnr(bitrates, base_psnrs, bitrates, prop_psnrs),
     }
+
+    # 선택적 비교군
+    for method_key in ['dwt', 'nr', 'hqdn3d']:
+        if method_key in active:
+            m_psnrs = _safe(results[method_key]['psnr'])
+            m_vmafs = _safe(results[method_key]['vmaf'])
+            summary[f'bd_rate_psnr_{method_key}'] = calculate_bd_rate(
+                bitrates, base_psnrs, bitrates, m_psnrs)
+            summary[f'bd_rate_vmaf_{method_key}'] = calculate_bd_rate(
+                bitrates, base_vmafs, bitrates, m_vmafs)
+        else:
+            summary[f'bd_rate_psnr_{method_key}'] = float('nan')
+            summary[f'bd_rate_vmaf_{method_key}'] = float('nan')
+
+    return summary
 
 
 def save_condition_csv(results, output_dir):
     """단일 조건의 raw data를 CSV로 저장합니다."""
     video = results['video']
     sigma = results['sigma']
+    active = results.get('active_methods', ['base', 'dwt', 'prop'])
     csv_path = os.path.join(output_dir, f"raw_data_{video}_s{sigma}.csv")
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
+        # 헤더: 활성 비교군만
         header = ['Bitrate(kbps)']
         for metric in METRIC_NAMES:
-            header.extend([f'Base_{metric.upper()}', f'DWT_{metric.upper()}',
-                           f'Prop_{metric.upper()}'])
+            for method_key in active:
+                label = method_key.upper()
+                header.append(f'{label}_{metric.upper()}')
         writer.writerow(header)
 
         for i, br in enumerate(results['bitrates']):
             row = [br]
             for metric in METRIC_NAMES:
-                row.extend([
-                    results['base'][metric][i],
-                    results['dwt'][metric][i],
-                    results['prop'][metric][i],
-                ])
+                for method_key in active:
+                    row.append(results[method_key][metric][i])
             writer.writerow(row)
 
     print(f"  💾 CSV 저장: {csv_path}")
+
 
 
 # ============================================================================
@@ -575,6 +622,12 @@ def main():
                         help="노이즈 랜덤 시드 (기본: 42)")
     parser.add_argument("--skip_existing", action="store_true",
                         help="이미 인코딩된 파일이 있으면 건너뜀")
+    parser.add_argument("--baselines", nargs='+',
+                        default=DEFAULT_BASELINES,
+                        choices=['base', 'nr', 'hqdn3d', 'dwt'],
+                        help=("포함할 비교군 목록 (prop은 항상 포함됨). "
+                              "기본: base dwt. "
+                              "강화 실험: --baselines base nr hqdn3d dwt"))
 
     args = parser.parse_args()
 
@@ -589,6 +642,7 @@ def main():
     print(f"  노이즈: σ = {args.sigma}")
     print(f"  비트레이트: {args.bitrates} kbps")
     print(f"  임계값: {args.threshold}")
+    print(f"  비교군: {args.baselines} + prop (always)")
     print(f"{'=' * 60}")
 
     all_results = {}
@@ -622,7 +676,8 @@ def main():
             # 2. 실험 수행
             results = run_single_condition(
                 video_name, clean_video, input_video, sigma,
-                args.output_dir, args.bitrates, args.threshold
+                args.output_dir, args.bitrates, args.threshold,
+                baselines=args.baselines
             )
 
             # 3. 결과 처리
