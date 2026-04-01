@@ -244,14 +244,13 @@ if __name__ == "__main__":
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
         processed_y_flat = processed_y_uint8.reshape((valid_frames, -1))
         
-        # U/V 채널 전처리 (크로마 노이즈 제거)
-        u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
-
+        # U/V 채널은 전처리 생략: 단일 파이프라인에서는 속도/단순화 우선.
+        # (run_rd_curve.py에서는 process_chroma로 U/V도 전처리하여 비교함)
         # 인코더로 프레임 단위 쓰기 (Y + U + V)
         for f in range(valid_frames):
             encoder_process.stdin.write(processed_y_flat[f].tobytes())
-            encoder_process.stdin.write(u_proc[f].tobytes())
-            encoder_process.stdin.write(v_proc[f].tobytes())
+            encoder_process.stdin.write(u_np[f].tobytes())
+            encoder_process.stdin.write(v_np[f].tobytes())
 
         chunk_idx += 1
         if chunk_idx % 5 == 0:

@@ -1,8 +1,8 @@
 """
-비디오 품질 평가 모듈: PSNR, SSIM, VMAF.
+비디오 품질 평가 모듈: PSNR, SSIM, VMAF, MS-SSIM, EPSNR, PSNR-B, GBIM, MEPR.
 
-FFmpeg의 내장 필터를 활용하여 참조(reference) 영상 대비
-왜곡(distorted) 영상의 품질 지표를 측정합니다.
+FFmpeg의 내장 필터 및 OpenCV를 활용하여 참조(reference) 영상 대비
+왜곡(distorted) 영상의 품질 지표를 한 번에 측정합니다.
 """
 
 import json
@@ -94,10 +94,10 @@ def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
         prev_dist_gray = dist_gray
 
     return (
-        np.mean(epsnr_list) if epsnr_list else 0,
-        np.mean(psnrb_list) if psnrb_list else 0,
-        np.mean(gbim_list) if gbim_list else 0,
-        np.mean(mepr_list) if mepr_list else 0
+        np.mean(epsnr_list) if epsnr_list else float('nan'),
+        np.mean(psnrb_list) if psnrb_list else float('nan'),
+        np.mean(gbim_list) if gbim_list else float('nan'),
+        np.mean(mepr_list) if mepr_list else float('nan')
     )
 
 
@@ -110,10 +110,11 @@ def evaluate_video_quality(ref_video, dist_video, num_frames_custom=60):
         num_frames_custom: OpenCV 기반 고급 지표를 계산할 프레임 수.
 
     Returns:
-        (psnr, ssim, vmaf, ms_ssim, epsnr, psnrb, gbim, mepr) 튜플. 측정 실패 시 일부 값은 None.
+        (psnr, ssim, vmaf, ms_ssim, epsnr, psnrb, gbim, mepr) 튜플.
+        측정 실패 시 해당 값은 float('nan')으로 반환됩니다.
     """
     if not os.path.exists(ref_video) or not os.path.exists(dist_video):
-        return None, None, None, None, None, None, None, None
+        return float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan')
 
     # 1. PSNR 및 SSIM 측정
     cmd_psnr_ssim = [
@@ -132,8 +133,8 @@ def evaluate_video_quality(ref_video, dist_video, num_frames_custom=60):
     psnr_match = re.search(r'PSNR.*average:([0-9.]+)', result.stderr)
     ssim_match = re.search(r'SSIM.*All:([0-9.]+)', result.stderr)
 
-    psnr_val = float(psnr_match.group(1)) if psnr_match else None
-    ssim_val = float(ssim_match.group(1)) if ssim_match else None
+    psnr_val = float(psnr_match.group(1)) if psnr_match else float('nan')
+    ssim_val = float(ssim_match.group(1)) if ssim_match else float('nan')
 
     # 2. VMAF & MS-SSIM 측정 (JSON 로그 생성 후 파싱)
     temp_vmaf_log = f"temp_vmaf_{os.path.basename(dist_video)}.json"
@@ -144,8 +145,8 @@ def evaluate_video_quality(ref_video, dist_video, num_frames_custom=60):
     ]
     subprocess.run(cmd_vmaf, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    vmaf_val = None
-    ms_ssim_val = None
+    vmaf_val = float('nan')
+    ms_ssim_val = float('nan')
     if os.path.exists(temp_vmaf_log):
         try:
             with open(temp_vmaf_log, 'r', encoding='utf-8') as f:

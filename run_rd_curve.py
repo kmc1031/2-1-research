@@ -123,15 +123,14 @@ def run_dwt3d_encoding(input_video, output_video, bitrate, threshold=0.03, max_f
 
 
 def run_proposed_encoding(input_video, output_video, bitrate, threshold,
-                          max_frames=float('inf'), disable_overlap=False, disable_adaptive=False,
-                          target_bitrate_kbps=None):
+                          max_frames=float('inf'), disable_overlap=False, disable_adaptive=False):
     """3D DT-CWT 전처리를 거친 후 x264로 압축하는 제안 기법을 생성합니다."""
     print(f"  [Proposed] {bitrate} 전처리 및 인코딩 중 (T={threshold})...")
     w, h, fps = get_video_metadata(input_video)
     encoder_process = create_x264_encoder(output_video, w, h, fps, bitrate)
     
     adaptive = not disable_adaptive
-    processor = DTCWT3DProcessor(threshold=threshold, adaptive_threshold=adaptive, target_bitrate_kbps=target_bitrate_kbps)
+    processor = DTCWT3DProcessor(threshold=threshold, adaptive_threshold=adaptive)
 
     overlap_frames = 0 if disable_overlap else 4
     total_processed_frames = 0
@@ -192,6 +191,14 @@ def plot_rd_curve(bitrates_kbps, baseline_scores, proposed_scores, dwt_scores, t
 
 def calculate_bd_rate(R1, PSNR1, R2, PSNR2):
     """Bjontegaard Delta Rate (BD-Rate): 동일 화질 대비 비트레이트 절감률(%)."""
+    valid1 = [(r, p) for r, p in zip(R1, PSNR1) if p is not None and not np.isnan(p)]
+    valid2 = [(r, p) for r, p in zip(R2, PSNR2) if p is not None and not np.isnan(p)]
+    if len(valid1) < 4 or len(valid2) < 4:
+        return float("nan")
+
+    R1, PSNR1 = zip(*valid1)
+    R2, PSNR2 = zip(*valid2)
+
     lR1, lR2 = np.log10(R1), np.log10(R2)
 
     p1 = np.polyfit(PSNR1, lR1, 3)
@@ -216,6 +223,14 @@ def calculate_bd_rate(R1, PSNR1, R2, PSNR2):
 
 def calculate_bd_psnr(R1, PSNR1, R2, PSNR2):
     """Bjontegaard Delta PSNR: 동일 비트레이트 대비 화질 향상도(dB)."""
+    valid1 = [(r, p) for r, p in zip(R1, PSNR1) if p is not None and not np.isnan(p)]
+    valid2 = [(r, p) for r, p in zip(R2, PSNR2) if p is not None and not np.isnan(p)]
+    if len(valid1) < 4 or len(valid2) < 4:
+        return float("nan")
+
+    R1, PSNR1 = zip(*valid1)
+    R2, PSNR2 = zip(*valid2)
+
     lR1, lR2 = np.log10(R1), np.log10(R2)
 
     p1 = np.polyfit(lR1, PSNR1, 3)
@@ -238,7 +253,7 @@ def calculate_bd_psnr(R1, PSNR1, R2, PSNR2):
     return avg_diff
 
 
-def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False, visualize_frame=None, noise_sigma=0):
+def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False, visualize_frame=None):
     """단일 비디오에 대해 모든 비트레이트의 인코딩 + 평가를 수행합니다.
 
     이 함수는 ProcessPoolExecutor의 워커에서 호출되므로,
@@ -251,23 +266,8 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
     if not os.path.exists(input_video):
         return None
 
-    # 노이즈 주입: noise_sigma > 0이면 FFmpeg로 노이즈가 포함된 소스 생성
-    actual_input = input_video
-    noisy_path = None
-    if noise_sigma > 0:
-        noisy_path = os.path.join(output_dir, f"{video_name}_noisy_s{noise_sigma}.y4m")
-        if not os.path.exists(noisy_path):
-            print(f"  [노이즈] σ={noise_sigma} Gaussian 노이즈 주입 → {noisy_path}")
-            cmd = [
-                "ffmpeg", "-y", "-i", input_video,
-                "-vf", f"noise=alls={noise_sigma}:allf=t",
-                noisy_path,
-            ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        actual_input = noisy_path
-
     print(f"\n{'=' * 50}")
-    print(f"  🎬 타겟 비디오: {video_name.upper()}" + (f" (σ_noise={noise_sigma})" if noise_sigma > 0 else ""))
+    print(f"  🎬 타겟 비디오: {video_name.upper()}")
     print(f"{'=' * 50}")
 
     base_psnrs, prop_psnrs, spat_psnrs, dwt_psnrs = [], [], [], []
@@ -286,12 +286,12 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
         spat_out = os.path.join(output_dir, f"{video_name}_spat_{br_str}.mp4")
         dwt_out = os.path.join(output_dir, f"{video_name}_dwt3d_{br_str}.mp4")
 
-        run_baseline_encoding(actual_input, base_out, br_str)
-        run_dwt3d_encoding(actual_input, dwt_out, br_str, threshold)
-        run_proposed_encoding(actual_input, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive, target_bitrate_kbps=br)
+        run_baseline_encoding(input_video, base_out, br_str)
+        run_dwt3d_encoding(input_video, dwt_out, br_str, threshold)
+        run_proposed_encoding(input_video, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive)
         
         if include_spatial:
-            run_spatial_encoding(actual_input, spat_out, br_str)
+            run_spatial_encoding(input_video, spat_out, br_str)
 
         print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (고급 지표 포함)...")
         b_p, b_s, b_v, b_ms, b_ep, b_pb, b_gb, b_me = evaluate_video_quality(input_video, base_out, num_frames_custom=60)
@@ -303,7 +303,7 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
             spat_psnrs.append(s_p); spat_ssims.append(s_s); spat_vmafs.append(s_v); spat_msssims.append(s_ms)
             spat_epsnrs.append(s_ep); spat_psnrbs.append(s_pb); spat_gbims.append(s_gb); spat_meprs.append(s_me)
         else:
-            s_p, s_v = 0.0, 0.0
+            s_p, s_v = float('nan'), float('nan')
 
         base_psnrs.append(b_p); base_ssims.append(b_s); base_vmafs.append(b_v); base_msssims.append(b_ms)
         base_epsnrs.append(b_ep); base_psnrbs.append(b_pb); base_gbims.append(b_gb); base_meprs.append(b_me)
@@ -353,8 +353,8 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
 
 
 def _safe(values):
-    """None 값을 0.0으로 치환하여 BD-Rate 계산 시 크래시를 방지합니다."""
-    return [v if v is not None else 0.0 for v in values]
+    """None 값을 float('nan')으로 치환하여 분석 왜곡을 방지합니다."""
+    return [v if v is not None else float('nan') for v in values]
 
 
 def report_and_save(result, output_dir):
@@ -388,10 +388,13 @@ def report_and_save(result, output_dir):
     bd_rate_psnr = calculate_bd_rate(bitrates, base_psnrs, bitrates, prop_psnrs)
     bd_rate_vmaf = calculate_bd_rate(bitrates, base_vmafs, bitrates, prop_vmafs)
 
+    bd_str_psnr = f"{bd_rate_psnr:.3f} %" if not np.isnan(bd_rate_psnr) else "N/A (데이터 부족)"
+    bd_str_vmaf = f"{bd_rate_vmaf:.3f} %" if not np.isnan(bd_rate_vmaf) else "N/A (데이터 부족)"
+
     print("-" * 50)
     print(f"  📈 [{video_name.upper()}] 최종 성능 지표")
-    print(f"  * BD-Rate (PSNR 기준): {bd_rate_psnr:.3f} %")
-    print(f"  * BD-Rate (VMAF 기준): {bd_rate_vmaf:.3f} %")
+    print(f"  * BD-Rate (PSNR 기준): {bd_str_psnr}")
+    print(f"  * BD-Rate (VMAF 기준): {bd_str_vmaf}")
     print("-" * 50)
 
     # Raw Data CSV 저장
@@ -459,16 +462,18 @@ def report_and_save(result, output_dir):
                     bpb, dpb, ppb, bgb, dgb, pgb, bme, dme, pme
                 ])
 
+    bd_title_psnr = f"{bd_rate_psnr:.2f}%" if not np.isnan(bd_rate_psnr) else "N/A"
+    bd_title_vmaf = f"{bd_rate_vmaf:.2f}%" if not np.isnan(bd_rate_vmaf) else "N/A"
     # RD Curve 생성
     plot_rd_curve(
         bitrates, base_psnrs, prop_psnrs, dwt_psnrs,
-        title=f"PSNR RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_rate_psnr:.2f}%",
+        title=f"PSNR RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_title_psnr}",
         filename=os.path.join(output_dir, f"rd_curve_psnr_{video_name}.png"),
         spatial_scores=spat_psnrs
     )
     plot_rd_curve(
         bitrates, base_vmafs, prop_vmafs, dwt_vmafs,
-        title=f"VMAF RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_rate_vmaf:.2f}%",
+        title=f"VMAF RD Curve ({video_name.capitalize()}) | BD-Rate: {bd_title_vmaf}",
         filename=os.path.join(output_dir, f"rd_curve_vmaf_{video_name}.png"),
         ylabel="VMAF Score",
         spatial_scores=spat_vmafs
@@ -490,7 +495,6 @@ if __name__ == "__main__":
     parser.add_argument("--disable_adaptive_threshold", action="store_true", help="적응형 임계값 산출 로직 비활성화")
     parser.add_argument("--include_spatial", action="store_true", help="단순 2D 공간 필터(Gaussian) 비교군 포함")
     parser.add_argument("--visualize_frame", type=int, default=None, help="프레임 비교/에지/잔차 시각화를 수행할 특정 프레임 번호")
-    parser.add_argument("--noise_sigma", type=int, default=0, help="소스 비디오에 주입할 Gaussian 노이즈 σ (0=노이즈 없음, 예: 5, 10, 15, 20)")
     
     args = parser.parse_args()
 
@@ -509,7 +513,7 @@ if __name__ == "__main__":
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial, args.visualize_frame, args.noise_sigma
+                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial, args.visualize_frame
             ): name
             for name in VIDEO_NAMES
         }

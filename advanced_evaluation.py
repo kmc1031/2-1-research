@@ -1,5 +1,5 @@
 """
-고급 비디오 품질 평가 모듈: MS-SSIM, EPSNR, PSNR-B, GBIM, Temporal STRRED.
+고급 비디오 품질 평가 모듈: MS-SSIM, EPSNR, PSNR-B, GBIM, Temporal MEPR.
 
 MS-SSIM은 FFmpeg libvmaf를 통해, 나머지 지표는 OpenCV로 프레임 단위 계산합니다.
 결과를 Baseline vs Proposed 막대 그래프로 시각화합니다.
@@ -27,7 +27,7 @@ def extract_ms_ssim_vmaf(ref_video, dist_video):
         dist_video: 왜곡 비디오 경로.
 
     Returns:
-        MS-SSIM 평균값 (float). 실패 시 0.0.
+        MS-SSIM 평균값 (float). 실패 시 float('nan').
     """
     temp_json = f"temp_metrics_{os.path.basename(dist_video)}.json"
     cmd = [
@@ -37,7 +37,7 @@ def extract_ms_ssim_vmaf(ref_video, dist_video):
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    ms_ssim_val = 0.0
+    ms_ssim_val = float('nan')
     if os.path.exists(temp_json):
         try:
             with open(temp_json, 'r', encoding='utf-8') as f:
@@ -122,10 +122,10 @@ def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
         prev_dist_gray = dist_gray
 
     return (
-        np.mean(epsnr_list),
-        np.mean(psnrb_list),
-        np.mean(gbim_list),
-        np.mean(mepr_list) if mepr_list else 0
+        np.mean(epsnr_list) if epsnr_list else float('nan'),
+        np.mean(psnrb_list) if psnrb_list else float('nan'),
+        np.mean(gbim_list) if gbim_list else float('nan'),
+        np.mean(mepr_list) if mepr_list else float('nan')
     )
 
 
@@ -197,12 +197,12 @@ def _plot_advanced_chart(video_name, bitrate,
                          epsnr_b, epsnr_p,
                          psnrb_b, psnrb_p,
                          gbim_b, gbim_p,
-                         strred_b, strred_p,
+                         mepr_b, mepr_p,
                          base_dir):
     """고급 지표 비교 막대 그래프를 생성합니다."""
     metrics_higher = ['MS-SSIM', 'EPSNR (dB)', 'PSNR-B (dB)', 'MEPR']
-    base_high = [ms_ssim_base, epsnr_b, psnrb_b, strred_b]
-    prop_high = [ms_ssim_prop, epsnr_p, psnrb_p, strred_p]
+    base_high = [ms_ssim_base, epsnr_b, psnrb_b, mepr_b]
+    prop_high = [ms_ssim_prop, epsnr_p, psnrb_p, mepr_p]
 
     fig, (ax1, ax2) = plt.subplots(
         1, 2, figsize=(14, 6), gridspec_kw={'width_ratios': [3, 1]}
@@ -214,7 +214,7 @@ def _plot_advanced_chart(video_name, bitrate,
 
     base_normalized = [100] * len(metrics_higher)
     prop_normalized = [
-        (p / b) * 100 if b != 0 else 0
+        (p / b) * 100 if (b is not None and not np.isnan(b) and b != 0) else float('nan')
         for p, b in zip(prop_high, base_high)
     ]
 
