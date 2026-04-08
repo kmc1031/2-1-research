@@ -182,3 +182,15 @@ cython_debug/
 
 outputs
 videos
+
+# 루트에 생성되는 임시 실험 파일
+*.mp4
+*.y4m
+stderr.log
+stderr.txt
+stdout.log
+profile_results.txt
+residual*.png
+
+# data/sample 안의 합성 비디오는 git으로 추적 (CI용)
+!data/sample/*.y4m

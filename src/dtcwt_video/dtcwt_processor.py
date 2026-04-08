@@ -12,7 +12,7 @@ _USE_CUDA = False
 try:
     import torch
     if torch.cuda.is_available():
-        from dtcwt_cuda import CudaDTCWT3DProcessor
+        from dtcwt_video.dtcwt_cuda import CudaDTCWT3DProcessor
         _USE_CUDA = True
         print("[DT-CWT] CUDA GPU 가속 활성화됨")
 except ImportError:

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies (CPU-only torch for CI)
+        run: |
+          # CI에서는 CPU-only torch 사용 (다운로드 속도 최적화)
+          uv sync --extra dev --override-requirements - <<'EOF'
+          torch==2.6.0
+          EOF
+        # CUDA 빌드를 피해 PyPI의 CPU 버전 사용
+
+      - name: Install FFmpeg (no libvmaf - CI 환경 제약)
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Verify FFmpeg
+        run: ffmpeg -version
+
+      - name: Run non-FFmpeg unit tests
+        # FFmpeg libvmaf가 없는 CI 환경에서도 실행 가능한 테스트만 실행
+        run: |
+          uv run pytest tests/ \
+            -m "not requires_ffmpeg and not requires_gpu" \
+            -v \
+            --tb=short \
+            --cov=src/dtcwt_video \
+            --cov-report=term-missing
+
+      - name: Check import health
+        # 핵심 모듈 import가 오류 없이 완료되는지 검증
+        run: |
+          uv run python -c "
+          from dtcwt_video import DTCWT3DProcessor, evaluate_video_quality
+          from dtcwt_video.encoders import run_baseline_encoding, calculate_bd_rate
+          from dtcwt_video.config import DEFAULT_THRESHOLD, DEFAULT_BITRATES
+          print('✅ All core imports successful')
+          "
+
+  lint:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dev dependencies
+        run: uv sync --extra dev
+
+      - name: Check for syntax errors (pyflakes)
+        run: |
+          uv run python -m py_compile src/dtcwt_video/__init__.py
+          uv run python -m py_compile src/dtcwt_video/config.py
+          uv run python -m py_compile src/dtcwt_video/encoders.py
+          echo "✅ Syntax checks passed"

@@ -12,7 +12,7 @@ import re
 import ffmpeg
 import numpy as np
 
-from dtcwt_processor import DTCWT3DProcessor
+from dtcwt_video.dtcwt_processor import DTCWT3DProcessor
 
 
 def read_exact(stdout, size):

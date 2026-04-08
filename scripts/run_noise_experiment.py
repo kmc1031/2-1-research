@@ -22,6 +22,12 @@ import csv
 import os
 import sys
 
+# Windows cp949 터미널에서 이모지/한글 출력 시 UnicodeEncodeError 방지
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -33,10 +39,10 @@ plt.rcParams['axes.unicode_minus'] = False
 
 import ffmpeg
 
-from main_pipeline import get_video_metadata, read_y4m_and_split, create_x264_encoder
-from dtcwt_processor import DTCWT3DProcessor
-from evaluate_metrics import evaluate_video_quality
-from run_rd_curve import (
+from dtcwt_video.pipeline import get_video_metadata, read_y4m_and_split, create_x264_encoder
+from dtcwt_video.dtcwt_processor import DTCWT3DProcessor
+from dtcwt_video.evaluate_metrics import evaluate_video_quality
+from dtcwt_video.encoders import (
     run_baseline_encoding, run_proposed_encoding, run_dwt3d_encoding,
     run_nr_encoding, run_hqdn3d_encoding,
     calculate_bd_rate, calculate_bd_psnr, _safe,
