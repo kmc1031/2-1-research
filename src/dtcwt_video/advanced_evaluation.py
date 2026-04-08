@@ -13,6 +13,8 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
+from dtcwt_video.evaluate_metrics import compute_custom_metrics
+
 # 상수 정의
 BLOCK_SIZE = 8          # 매크로블록 크기 (H.264 기본)
 EDGE_PERCENTILE = 80    # 상위 20% 에지를 마스크로 사용
@@ -49,84 +51,6 @@ def extract_ms_ssim_vmaf(ref_video, dist_video):
             os.remove(temp_json)
     return ms_ssim_val
 
-
-def compute_custom_metrics(ref_cap, dist_cap, num_frames=30):
-    """프레임 단위로 EPSNR, PSNR-B, GBIM, MEPR을 계산합니다.
-
-    Args:
-        ref_cap: 원본 비디오의 cv2.VideoCapture 객체.
-        dist_cap: 왜곡 비디오의 cv2.VideoCapture 객체.
-        num_frames: 분석할 프레임 수.
-
-    Returns:
-        (epsnr_mean, psnrb_mean, gbim_mean, mepr_mean) 튜플.
-    """
-    epsnr_list, psnrb_list, gbim_list, mepr_list = [], [], [], []
-    prev_ref_gray = None
-    prev_dist_gray = None
-
-    for _ in range(num_frames):
-        ret1, f_ref = ref_cap.read()
-        ret2, f_dist = dist_cap.read()
-        if not ret1 or not ret2:
-            break
-
-        ref_gray = cv2.cvtColor(f_ref, cv2.COLOR_BGR2GRAY).astype(np.float64)
-        dist_gray = cv2.cvtColor(f_dist, cv2.COLOR_BGR2GRAY).astype(np.float64)
-
-        # --- 1. EPSNR (Edge-PSNR) ---
-        sobelx = cv2.Sobel(ref_gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(ref_gray, cv2.CV_64F, 0, 1, ksize=3)
-        mag = np.sqrt(sobelx**2 + sobely**2)
-        edge_mask = mag > np.percentile(mag, EDGE_PERCENTILE)
-
-        mse_edge = np.mean((ref_gray[edge_mask] - dist_gray[edge_mask])**2)
-        epsnr = 10 * np.log10((MAX_PIXEL_VALUE**2) / (mse_edge + 1e-10))
-        epsnr_list.append(epsnr)
-
-        # --- 2. GBIM & PSNR-B ---
-        h, w = ref_gray.shape
-        col_edges = np.arange(BLOCK_SIZE - 1, w - 1, BLOCK_SIZE)
-        row_edges = np.arange(BLOCK_SIZE - 1, h - 1, BLOCK_SIZE)
-
-        # GBIM: 블록 경계에서의 픽셀 단절 측정
-        diff_h = np.abs(dist_gray[:, col_edges] - dist_gray[:, col_edges + 1])
-        diff_v = np.abs(dist_gray[row_edges, :] - dist_gray[row_edges + 1, :])
-        gbim_val = (np.mean(diff_h) + np.mean(diff_v)) / 2.0
-        gbim_list.append(gbim_val)
-
-        # PSNR-B (Yim & Bovik, 2011): 블록 경계의 blocking effect를 분리하여 보정
-        mse_total = np.mean((ref_gray - dist_gray)**2)
-        
-        block_diff_h = np.mean((dist_gray[:, col_edges] - dist_gray[:, col_edges + 1])**2)
-        block_diff_v = np.mean((dist_gray[row_edges, :] - dist_gray[row_edges + 1, :])**2)
-        blocking_effect = (block_diff_h + block_diff_v) / 2.0
-        
-        ref_diff_h = np.mean((ref_gray[:, col_edges] - ref_gray[:, col_edges + 1])**2)
-        ref_diff_v = np.mean((ref_gray[row_edges, :] - ref_gray[row_edges + 1, :])**2)
-        natural_edge = (ref_diff_h + ref_diff_v) / 2.0
-        
-        added_blocking = max(0, blocking_effect - natural_edge)
-        mse_b = mse_total + added_blocking
-        psnrb = 10 * np.log10((MAX_PIXEL_VALUE**2) / (mse_b + 1e-10))
-        psnrb_list.append(psnrb)
-
-        # --- 3. MEPR (Motion Energy Preservation Ratio) ---
-        if prev_ref_gray is not None:
-            mot_ref = np.mean(np.abs(ref_gray - prev_ref_gray))
-            mot_dist = np.mean(np.abs(dist_gray - prev_dist_gray))
-            mepr = min(mot_dist, mot_ref) / (max(mot_dist, mot_ref) + 1e-10)
-            mepr_list.append(mepr)
-
-        prev_ref_gray = ref_gray
-        prev_dist_gray = dist_gray
-
-    return (
-        np.mean(epsnr_list) if epsnr_list else float('nan'),
-        np.mean(psnrb_list) if psnrb_list else float('nan'),
-        np.mean(gbim_list) if gbim_list else float('nan'),
-        np.mean(mepr_list) if mepr_list else float('nan')
-    )
 
 
 def evaluate_and_plot_advanced(video_name, bitrate):

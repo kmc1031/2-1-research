@@ -128,7 +128,17 @@ def calculate_bd_psnr(R1, PSNR1, R2, PSNR2):
     return avg_diff
 
 
-def process_single_video(video_name, input_dir, output_dir, bitrates, threshold, disable_overlap, disable_adaptive, include_spatial=False, visualize_frame=None):
+def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
+                         disable_overlap, disable_adaptive,
+                         include_spatial=False, visualize_frame=None,
+                         threshold_mode: str = "adaptive",
+                         controller_a: float = 0.35,
+                         controller_b: float = 0.25,
+                         controller_c: float = 0.25,
+                         controller_d: float = 0.25,
+                         min_multiplier: float = 0.5,
+                         max_multiplier: float = 2.5,
+                         disable_rate_aware_scene_reset: bool = False):
     """단일 비디오에 대해 모든 비트레이트의 인코딩 + 평가를 수행합니다.
 
     이 함수는 ProcessPoolExecutor의 워커에서 호출되므로,
@@ -163,7 +173,19 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
 
         run_baseline_encoding(input_video, base_out, br_str)
         run_dwt3d_encoding(input_video, dwt_out, br_str, threshold)
-        run_proposed_encoding(input_video, prop_out, br_str, threshold, disable_overlap=disable_overlap, disable_adaptive=disable_adaptive)
+        run_proposed_encoding(
+            input_video, prop_out, br_str, threshold,
+            disable_overlap=disable_overlap,
+            disable_adaptive=disable_adaptive,
+            threshold_mode=threshold_mode,
+            controller_a=controller_a,
+            controller_b=controller_b,
+            controller_c=controller_c,
+            controller_d=controller_d,
+            min_multiplier=min_multiplier,
+            max_multiplier=max_multiplier,
+            disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
+        )
         
         if include_spatial:
             run_spatial_encoding(input_video, spat_out, br_str)
@@ -372,6 +394,16 @@ def main():
                         help="테스트할 비트레이트 목록(kbps)")
     parser.add_argument("-t", "--threshold", type=float, default=0.03,
                         help="DT-CWT 임계값")
+    parser.add_argument("--threshold_mode", choices=["fixed", "adaptive", "rate_aware"],
+                        default="adaptive", help="DT-CWT 임계값 모드")
+    parser.add_argument("--controller_a", type=float, default=0.35, help="rate-aware 노이즈 계수")
+    parser.add_argument("--controller_b", type=float, default=0.25, help="rate-aware 비트레이트 계수")
+    parser.add_argument("--controller_c", type=float, default=0.25, help="rate-aware 모션 계수")
+    parser.add_argument("--controller_d", type=float, default=0.25, help="rate-aware 에지 계수")
+    parser.add_argument("--min_multiplier", type=float, default=0.5, help="rate-aware 최소 배율")
+    parser.add_argument("--max_multiplier", type=float, default=2.5, help="rate-aware 최대 배율")
+    parser.add_argument("--disable_rate_aware_scene_reset", action="store_true",
+                        help="장면 전환 시 rate-aware 배율 초기화 비활성화")
     parser.add_argument("--max_workers", type=int, default=None,
                         help="병렬 처리 워커 수 (기본값: 코어 수에 맞게 자동 설정)")
     parser.add_argument("--disable_overlap", action="store_true",
@@ -396,13 +428,18 @@ def main():
                      args.max_workers if args.max_workers else (os.cpu_count() or 1))
 
     print(f"=== RD Curve 다중 비디오 자동화 시작 (병렬: {MAX_WORKERS}개 워커) ===")
+    print(f"    threshold: {THRESHOLD} | mode: {args.threshold_mode}")
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
                 process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD,
                 args.disable_overlap, args.disable_adaptive_threshold,
-                args.include_spatial, args.visualize_frame
+                args.include_spatial, args.visualize_frame,
+                args.threshold_mode, args.controller_a, args.controller_b,
+                args.controller_c, args.controller_d,
+                args.min_multiplier, args.max_multiplier,
+                args.disable_rate_aware_scene_reset
             ): name
             for name in VIDEO_NAMES
         }

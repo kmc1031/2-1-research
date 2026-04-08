@@ -133,7 +133,16 @@ DEFAULT_BASELINES = ['base', 'dwt']   # 기본 실행 비교군 (prop은 항상 
 
 
 def run_single_condition(video_name, clean_video, input_video, sigma,
-                         output_dir, bitrates, threshold, baselines=None):
+                         output_dir, bitrates, threshold, baselines=None,
+                         threshold_mode: str = "adaptive",
+                         controller_a: float = 0.35,
+                         controller_b: float = 0.25,
+                         controller_c: float = 0.25,
+                         controller_d: float = 0.25,
+                         min_multiplier: float = 0.5,
+                         max_multiplier: float = 2.5,
+                         disable_rate_aware_scene_reset: bool = False,
+                         log_context: bool = False):
     """단일 노이즈 조건에서 여러 비교군과 Proposed의 실험을 수행합니다.
 
     Args:
@@ -190,7 +199,25 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
             elif method_key == 'dwt':
                 run_dwt3d_encoding(input_video, out_path, br_str, threshold)
             elif method_key == 'prop':
-                run_proposed_encoding(input_video, out_path, br_str, threshold)
+                ctx_log = None
+                if log_context:
+                    os.makedirs(os.path.join(output_dir, "context_logs"), exist_ok=True)
+                    ctx_log = os.path.join(
+                        output_dir, "context_logs",
+                        f"{prefix}_{br_str}_ctx.csv"
+                    )
+                run_proposed_encoding(
+                    input_video, out_path, br_str, threshold,
+                    threshold_mode=threshold_mode,
+                    controller_a=controller_a,
+                    controller_b=controller_b,
+                    controller_c=controller_c,
+                    controller_d=controller_d,
+                    min_multiplier=min_multiplier,
+                    max_multiplier=max_multiplier,
+                    disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
+                    log_context_path=ctx_log,
+                )
 
         # --- 품질 평가 (참조 = 항상 clean 원본!) ---
         print(f"  [평가] {condition} - {br_str} (참조: clean 원본)")
@@ -624,6 +651,18 @@ def main():
                         help="Gaussian 노이즈 σ 목록 (0=clean) (기본: 0 5 10 15)")
     parser.add_argument("-t", "--threshold", type=float, default=0.03,
                         help="DT-CWT 임계값 (기본: 0.03)")
+    parser.add_argument("--threshold_mode", choices=["fixed", "adaptive", "rate_aware"],
+                        default="adaptive", help="DT-CWT 임계값 모드")
+    parser.add_argument("--controller_a", type=float, default=0.35, help="rate-aware 노이즈 계수")
+    parser.add_argument("--controller_b", type=float, default=0.25, help="rate-aware 비트레이트 계수")
+    parser.add_argument("--controller_c", type=float, default=0.25, help="rate-aware 모션 계수")
+    parser.add_argument("--controller_d", type=float, default=0.25, help="rate-aware 에지 계수")
+    parser.add_argument("--min_multiplier", type=float, default=0.5, help="rate-aware 최소 배율")
+    parser.add_argument("--max_multiplier", type=float, default=2.5, help="rate-aware 최대 배율")
+    parser.add_argument("--disable_rate_aware_scene_reset", action="store_true",
+                        help="장면 전환 시 배율 중립화 비활성화")
+    parser.add_argument("--log_context", action="store_true",
+                        help="Proposed 청크 컨텍스트 CSV 로깅")
     parser.add_argument("--seed", type=int, default=42,
                         help="노이즈 랜덤 시드 (기본: 42)")
     parser.add_argument("--skip_existing", action="store_true",
@@ -647,7 +686,7 @@ def main():
     print(f"  비디오: {args.video_names}")
     print(f"  노이즈: σ = {args.sigma}")
     print(f"  비트레이트: {args.bitrates} kbps")
-    print(f"  임계값: {args.threshold}")
+    print(f"  임계값: {args.threshold} | 모드: {args.threshold_mode}")
     print(f"  비교군: {args.baselines} + prop (always)")
     print(f"{'=' * 60}")
 
@@ -683,7 +722,16 @@ def main():
             results = run_single_condition(
                 video_name, clean_video, input_video, sigma,
                 args.output_dir, args.bitrates, args.threshold,
-                baselines=args.baselines
+                baselines=args.baselines,
+                threshold_mode=args.threshold_mode,
+                controller_a=args.controller_a,
+                controller_b=args.controller_b,
+                controller_c=args.controller_c,
+                controller_d=args.controller_d,
+                min_multiplier=args.min_multiplier,
+                max_multiplier=args.max_multiplier,
+                disable_rate_aware_scene_reset=args.disable_rate_aware_scene_reset,
+                log_context=args.log_context,
             )
 
             # 3. 결과 처리

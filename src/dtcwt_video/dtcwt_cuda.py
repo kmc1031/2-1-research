@@ -9,6 +9,7 @@ NVIDIA GPU에서 가속합니다.
 import torch
 import torch.nn.functional as F
 import numpy as np
+import math
 from dtcwt.coeffs import biort as _biort, qshift as _qshift
 from dtcwt.utils import reflect
 
@@ -499,15 +500,34 @@ class CudaDTCWT3DProcessor:
     """
 
     def __init__(self, threshold=0.03, nlevels=1, device='cuda',
-                 adaptive_threshold=True,
+                 adaptive_threshold=True, threshold_mode: str = "adaptive",
+                 controller_a: float = 0.35,
+                 controller_b: float = 0.25,
+                 controller_c: float = 0.25,
+                 controller_d: float = 0.25,
+                 min_multiplier: float = 0.5,
+                 max_multiplier: float = 2.5,
+                 neutral_bitrate_kbps: float = 800.0,
+                 disable_rate_aware_scene_reset: bool = False,
                  biort_name='near_sym_a', qshift_name='qshift_a'):
         self.threshold = threshold
         self.nlevels = nlevels
         self.device = torch.device(device)
         self.ext_mode = 4
-        self.adaptive_threshold = adaptive_threshold
+        self.threshold_mode = threshold_mode or ("adaptive" if adaptive_threshold else "fixed")
+        self.adaptive_threshold = self.threshold_mode != "fixed"
         self.biort_name = biort_name
         self.qshift_name = qshift_name
+        self.controller_a = controller_a
+        self.controller_b = controller_b
+        self.controller_c = controller_c
+        self.controller_d = controller_d
+        self.min_multiplier = min_multiplier
+        self.max_multiplier = max_multiplier
+        self.neutral_bitrate_kbps = neutral_bitrate_kbps
+        self.scene_reset_enabled = not disable_rate_aware_scene_reset
+        self.context = None
+        self._last_multiplier = 1.0
 
         # 필터 계수 로딩 → PyTorch 텐서
         biort_coeffs = _biort(biort_name)
@@ -519,6 +539,35 @@ class CudaDTCWT3DProcessor:
         self.h0o, self.g0o, self.h1o, self.g1o = [_t(c) for c in biort_coeffs]
         self.h0a, self.h0b, self.g0a, self.g0b = [_t(c) for c in qshift_coeffs[:4]]
         self.h1a, self.h1b, self.g1a, self.g1b = [_t(c) for c in qshift_coeffs[4:8]]
+
+    def set_context(self, context):
+        self.context = context
+
+    def compute_controller_multiplier(self, context=None) -> float:
+        ctx = context or self.context
+        if self.threshold_mode != "rate_aware" or ctx is None:
+            self._last_multiplier = 1.0
+            return 1.0
+
+        bitrate_term = math.log(
+            max(self.neutral_bitrate_kbps, 1e-6) /
+            max(getattr(ctx, "target_bitrate_kbps", 0.0) or 1e-3, 1e-3)
+        )
+        noise_term = math.log1p(max(getattr(ctx, "noise_level", 0.0), 0.0) * 10.0)
+        motion_term = math.log1p(max(getattr(ctx, "motion_strength", 0.0), 0.0) * 5.0)
+        edge_term = math.log1p(max(getattr(ctx, "edge_density", 0.0), 0.0) * 5.0)
+
+        mult = math.exp(
+            self.controller_a * noise_term
+            + self.controller_b * bitrate_term
+            - self.controller_c * motion_term
+            - self.controller_d * edge_term
+        )
+        if getattr(ctx, "scene_cut", False) and self.scene_reset_enabled:
+            mult = 1.0
+        mult = max(self.min_multiplier, min(self.max_multiplier, mult))
+        self._last_multiplier = mult
+        return mult
 
     def forward(self, X_np, nlevels=None):
         """순방향 3D DT-CWT.
@@ -590,8 +639,8 @@ class CudaDTCWT3DProcessor:
         return X.cpu().numpy()
 
     def apply_shrinkage(self, highpasses):
-        """Spatio-Temporal Adaptive Thresholding (BayesShrink 기반) 또는 고정 임계값 감산."""
-        if not self.adaptive_threshold:
+        """Spatio-Temporal Adaptive Thresholding (BayesShrink 기반) 또는 고정/Rate-aware 임계값 감산."""
+        if self.threshold_mode == "fixed":
             shrunk_levels = []
             for Yh in highpasses:
                 mag = torch.abs(Yh)
@@ -612,6 +661,7 @@ class CudaDTCWT3DProcessor:
         sigma = mad / 0.6745
         sigma_sq = sigma ** 2
         
+        controller_mult = self.compute_controller_multiplier()
         shrunk_levels = []
         for level_idx, Yh in enumerate(highpasses):
             # Yh: (H, W, T, 28)
@@ -628,6 +678,8 @@ class CudaDTCWT3DProcessor:
             base_factor = self.threshold * (2.0 ** level_idx)
             # T_adapt shape: (1, 1, 1, 28)
             T_adapt = (sigma_sq / sigma_x) * base_factor
+            if self.threshold_mode == "rate_aware":
+                T_adapt = T_adapt * controller_mult
             
             phase = torch.where(mag > 0, Yh / mag, torch.zeros_like(Yh))
             shrunk_mag = torch.clamp(mag - T_adapt, min=0.0)

@@ -120,6 +120,17 @@ uv run python run_noise_experiment.py -v akiyo --sigma 0 10 -b 100 300 500
 uv run python run_rd_curve.py
 ```
 
+### 🆕 Rate-aware DT-CWT 컨트롤러
+
+- 활성화: `--threshold-mode rate_aware` (기본은 `adaptive` 유지)
+- 계수 튜닝: `--controller-a/b/c/d` (기본 0.35/0.25/0.25/0.25)
+- 배율 범위: `--min-multiplier`, `--max-multiplier` (기본 0.5~2.5)
+- 장면 전환 중립화 해제: `--disable-rate-aware-scene-reset`
+- 컨텍스트 CSV 로깅: `--log-context` → `logs/context_log_<video>_<bitrate>.csv`
+- 동일 플래그를 `run_noise_experiment.py` / `run_rd_curve.py`에도 전달 가능
+
+컨트롤러는 **비트레이트↓·노이즈↑ → 임계값 강화**, **모션↑·에지↑ → 임계값 완화**하도록 설계되었습니다.
+
 ### 🔍 시각화 도구
 
 ```bash

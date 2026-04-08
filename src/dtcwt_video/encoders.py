@@ -19,11 +19,12 @@ Bjontegaard Delta:
 """
 
 import subprocess
+import csv
 
 import cv2
 import numpy as np
 
-from dtcwt_video.pipeline import get_video_metadata, read_y4m_and_split, create_x264_encoder
+from dtcwt_video.pipeline import get_video_metadata, read_y4m_and_split, create_x264_encoder, build_processing_context
 from dtcwt_video.dtcwt_processor import DTCWT3DProcessor
 
 
@@ -196,7 +197,16 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
                            threshold: float,
                            max_frames: float = float('inf'),
                            disable_overlap: bool = False,
-                           disable_adaptive: bool = False) -> None:
+                           disable_adaptive: bool = False,
+                           threshold_mode: str = "adaptive",
+                           controller_a: float = 0.35,
+                           controller_b: float = 0.25,
+                           controller_c: float = 0.25,
+                           controller_d: float = 0.25,
+                           min_multiplier: float = 0.5,
+                           max_multiplier: float = 2.5,
+                           disable_rate_aware_scene_reset: bool = False,
+                           log_context_path: str | None = None) -> None:
     """3D DT-CWT 전처리를 거친 후 x264로 압축하는 제안 기법을 생성합니다.
 
     Args:
@@ -207,21 +217,58 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
         max_frames: 최대 처리 프레임 수.
         disable_overlap: True이면 청크 간 오버랩을 비활성화.
         disable_adaptive: True이면 적응형 임계값을 비활성화.
+        threshold_mode: fixed / adaptive / rate_aware.
+        controller_*: rate-aware 계수.
+        log_context_path: 지정 시 청크별 컨텍스트 CSV 기록.
     """
-    print(f"  [Proposed] {bitrate} 전처리 및 인코딩 중 (T={threshold})...")
+    print(f"  [Proposed] {bitrate} 전처리 및 인코딩 중 (T={threshold}, mode={threshold_mode})...")
     w, h, fps = get_video_metadata(input_video)
     encoder_process = create_x264_encoder(output_video, w, h, fps, bitrate)
 
     adaptive = not disable_adaptive
-    processor = DTCWT3DProcessor(threshold=threshold, adaptive_threshold=adaptive)
+    processor = DTCWT3DProcessor(
+        threshold=threshold,
+        adaptive_threshold=adaptive,
+        threshold_mode=threshold_mode if not disable_adaptive else "fixed",
+        controller_a=controller_a,
+        controller_b=controller_b,
+        controller_c=controller_c,
+        controller_d=controller_d,
+        min_multiplier=min_multiplier,
+        max_multiplier=max_multiplier,
+        disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
+    )
+
+    log_writer = None
+    if log_context_path:
+        log_fp = open(log_context_path, "w", newline="", encoding="utf-8")
+        log_writer = csv.writer(log_fp)
+        log_writer.writerow(["chunk", "overlap", "bitrate_kbps", "noise", "motion",
+                             "edge_density", "scene_cut", "threshold_mode", "multiplier"])
 
     overlap_frames = 0 if disable_overlap else 4
     total_processed_frames = 0
-    for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=overlap_frames
+    chunk_idx = 0
+    for y_array, u_np, v_np, frames, overlap_len, scene_cut in read_y4m_and_split(
+        input_video, w, h, fps=fps, chunk_size=8, overlap=overlap_frames,
+        return_scene_change=True
     ):
         if total_processed_frames >= max_frames:
             break
+
+        ctx_log = {
+            "bitrate_kbps": np.nan,
+            "noise": np.nan,
+            "motion": np.nan,
+            "edge_density": np.nan,
+        }
+        if threshold_mode == "rate_aware":
+            ctx, ctx_log = build_processing_context(
+                y_array, bitrate, chunk_idx, fps, scene_cut, threshold_mode
+            )
+            processor.set_context(ctx)
+        else:
+            processor.set_context(None)
 
         processed_y = processor.process_chunk(y_array, overlap_len=overlap_len)
         processed_y_valid = processed_y[overlap_len:overlap_len + frames]
@@ -239,8 +286,25 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
 
         total_processed_frames += valid_frames
 
+        if log_writer:
+            log_writer.writerow([
+                chunk_idx,
+                overlap_len,
+                ctx_log["bitrate_kbps"] if threshold_mode == "rate_aware" else np.nan,
+                ctx_log["noise"] if threshold_mode == "rate_aware" else np.nan,
+                ctx_log["motion"] if threshold_mode == "rate_aware" else np.nan,
+                ctx_log["edge_density"] if threshold_mode == "rate_aware" else np.nan,
+                scene_cut,
+                threshold_mode,
+                processor.compute_controller_multiplier(),
+            ])
+
+        chunk_idx += 1
+
     encoder_process.stdin.close()
     encoder_process.wait()
+    if log_writer:
+        log_fp.close()
 
 
 # ─── BD-Rate / BD-PSNR ────────────────────────────────────────────────────────
