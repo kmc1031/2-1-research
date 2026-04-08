@@ -355,22 +355,34 @@ def report_and_save(result, output_dir):
     )
 
 
-# --- 메인 실험 루프 ---
-if __name__ == "__main__":
+def main():
+    """RD Curve 실험 CLI 진입점."""
     import argparse
 
     parser = argparse.ArgumentParser(description="RD Curve 실험을 위한 자동화 파이프라인")
-    parser.add_argument("-v", "--video_names", nargs='+', default=["akiyo", "foreman", "mobile", "stefan"], help="처리할 비디오 이름 목록 (예: akiyo foreman)")
-    parser.add_argument("-i", "--input_dir", default="./videos", help="입력 비디오 디렉토리")
-    parser.add_argument("-o", "--output_dir", default="./outputs", help="출력 디렉토리 (자동 생성)")
-    parser.add_argument("-b", "--bitrates", nargs='+', type=int, default=[100, 200, 300, 400, 500], help="테스트할 비트레이트 목록(kbps)")
-    parser.add_argument("-t", "--threshold", type=float, default=0.03, help="DT-CWT 임계값")
-    parser.add_argument("--max_workers", type=int, default=None, help="병렬 처리 워커 수 (기본값: 코어 수에 맞게 자동 설정)")
-    parser.add_argument("--disable_overlap", action="store_true", help="오버랩 방식 블록 기반 처리 비활성화")
-    parser.add_argument("--disable_adaptive_threshold", action="store_true", help="적응형 임계값 산출 로직 비활성화")
-    parser.add_argument("--include_spatial", action="store_true", help="단순 2D 공간 필터(Gaussian) 비교군 포함")
-    parser.add_argument("--visualize_frame", type=int, default=None, help="프레임 비교/에지/잔차 시각화를 수행할 특정 프레임 번호")
-    
+    parser.add_argument("-v", "--video_names", nargs='+',
+                        default=["akiyo", "foreman", "mobile", "stefan"],
+                        help="처리할 비디오 이름 목록 (예: akiyo foreman)")
+    parser.add_argument("-i", "--input_dir", default="./videos",
+                        help="입력 비디오 디렉토리")
+    parser.add_argument("-o", "--output_dir", default="./outputs",
+                        help="출력 디렉토리 (자동 생성)")
+    parser.add_argument("-b", "--bitrates", nargs='+', type=int,
+                        default=[100, 200, 300, 400, 500],
+                        help="테스트할 비트레이트 목록(kbps)")
+    parser.add_argument("-t", "--threshold", type=float, default=0.03,
+                        help="DT-CWT 임계값")
+    parser.add_argument("--max_workers", type=int, default=None,
+                        help="병렬 처리 워커 수 (기본값: 코어 수에 맞게 자동 설정)")
+    parser.add_argument("--disable_overlap", action="store_true",
+                        help="오버랩 방식 블록 기반 처리 비활성화")
+    parser.add_argument("--disable_adaptive_threshold", action="store_true",
+                        help="적응형 임계값 산출 로직 비활성화")
+    parser.add_argument("--include_spatial", action="store_true",
+                        help="단순 2D 공간 필터(Gaussian) 비교군 포함")
+    parser.add_argument("--visualize_frame", type=int, default=None,
+                        help="프레임 비교/에지/잔차 시각화를 수행할 특정 프레임 번호")
+
     args = parser.parse_args()
 
     VIDEO_NAMES = args.video_names
@@ -380,15 +392,17 @@ if __name__ == "__main__":
 
     BITRATES = args.bitrates
     THRESHOLD = args.threshold
-    MAX_WORKERS = min(len(VIDEO_NAMES), args.max_workers if args.max_workers else (os.cpu_count() or 1))
+    MAX_WORKERS = min(len(VIDEO_NAMES),
+                     args.max_workers if args.max_workers else (os.cpu_count() or 1))
 
-    print(f"=== 🚀 다중 비디오 자동화 시작 (병렬: {MAX_WORKERS}개 워커) ===")
+    print(f"=== RD Curve 다중 비디오 자동화 시작 (병렬: {MAX_WORKERS}개 워커) ===")
 
-    # 비디오별로 병렬 처리
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD, args.disable_overlap, args.disable_adaptive_threshold, args.include_spatial, args.visualize_frame
+                process_single_video, name, INPUT_DIR, OUTPUT_DIR, BITRATES, THRESHOLD,
+                args.disable_overlap, args.disable_adaptive_threshold,
+                args.include_spatial, args.visualize_frame
             ): name
             for name in VIDEO_NAMES
         }
@@ -400,6 +414,11 @@ if __name__ == "__main__":
                 if result is not None:
                     report_and_save(result, OUTPUT_DIR)
             except Exception as e:
-                print(f"🚨 [{video_name}] 처리 중 오류 발생: {e}")
+                print(f"[ERROR] [{video_name}] 처리 중 오류 발생: {e}")
 
-    print("\n=== ✅ 전체 실험 완료 ===")
+    print("\n=== 전체 실험 완료 ===")
+
+
+# --- 메인 실험 루프 ---
+if __name__ == "__main__":
+    main()

@@ -285,7 +285,10 @@ def _level1_xfm(X, h0o, h1o, ext_mode):
 
 def _level1_ifm(Yl, Yh, g0o, g1o):
     """Level 1 역방향 3D DT-CWT (GPU 배치 연산)."""
+    target_low = max(Yl.shape[2], Yh.shape[2] * 2)
     ws = [s * 2 for s in Yl.shape]
+    # 청크 캐싱으로 시간축 highpass 길이가 더 긴 경우 보정
+    ws[2] = max(ws[2], target_low * 2)
     work = torch.zeros(ws, dtype=Yl.dtype, device=Yl.device)
 
     Xshape = [s // 2 for s in ws]
@@ -307,7 +310,40 @@ def _level1_ifm(Yl, Yh, g0o, g1o):
     x1b = slice(ws[1] // 2, ws[1] // 2 + Xshape[1])
     x2b = slice(ws[2] // 2, ws[2] // 2 + Xshape[2])
 
+    # 저주파가 부족한 경우 대칭(reflect) 확장 후 필요한 길이만 사용
+    pad_low = max(Xshape[2] - Yl.shape[2], 0)
+    if pad_low:
+        first = Yl[:, :, :1]
+        second = Yl[:, :, 1:2] if Yl.shape[2] > 1 else first
+        extrap1 = first * 2 - second
+        if pad_low == 1:
+            Yl = torch.cat([extrap1, Yl], dim=2)
+        else:
+            extrap2 = extrap1 * 2 - first
+            pads = torch.cat([extrap2, extrap1], dim=2)
+            Yl = torch.cat([pads, Yl], dim=2)
+        Yl = Yl[:, :, :Xshape[2]]
+
     # 복소 계수 → 옥탠트
+    # 청크 경계에서 highpass concat을 수행할 때 시간축 길이가
+    # 원래 기대치(= ceil(T_low / 2))와 다를 수 있다.
+    # 부족하면 앞쪽을 0 패딩, 길면 앞부분을 우선 사용.
+    expected_t = (Xshape[2] + 1) // 2
+    if Yh.shape[2] > expected_t:
+        Yh = Yh[:, :, :expected_t, :]
+    elif Yh.shape[2] < expected_t:
+        pad_t = expected_t - Yh.shape[2]
+        first = Yh[:, :, :1, :]
+        second = Yh[:, :, 1:2, :] if Yh.shape[2] > 1 else first
+        extrap1 = first * 2 - second
+        if pad_t == 1:
+            Yh = torch.cat([extrap1, Yh], dim=2)
+        else:
+            extrap2 = extrap1 * 2 - first
+            pads = torch.cat([extrap2, extrap1], dim=2)
+            Yh = torch.cat([pads, Yh], dim=2)
+        Yh = Yh[:, :, :expected_t, :]
+
     work[s0a, s1a, s2a] = Yl
     work[x0a, x1b, x2a] = _c2cube(Yh[:, :, :, 0:4])
     work[x0b, x1a, x2a] = _c2cube(Yh[:, :, :, 4:8])
@@ -334,6 +370,14 @@ def _level1_ifm(Yl, Yh, g0o, g1o):
 
     if even_g:
         return result[1:, 1:, 1:]
+    if pad_low > 0:
+        tail_len = Yl.shape[2] - pad_low
+        if tail_len > 0:
+            tail_lo = Yl[:, :, -tail_len:]
+            tail_hp_len = (tail_len + 1) // 2
+            tail_hp = Yh[:, :, -tail_hp_len:, :]
+            tail_rec = _level1_ifm(tail_lo, tail_hp, g0o, g1o)
+            result[:, :, -tail_len:] = tail_rec[:, :, -tail_len:]
     return result
 
 
@@ -462,6 +506,8 @@ class CudaDTCWT3DProcessor:
         self.device = torch.device(device)
         self.ext_mode = 4
         self.adaptive_threshold = adaptive_threshold
+        self.biort_name = biort_name
+        self.qshift_name = qshift_name
 
         # 필터 계수 로딩 → PyTorch 텐서
         biort_coeffs = _biort(biort_name)
@@ -512,6 +558,21 @@ class CudaDTCWT3DProcessor:
         """
         X = Yl
         nlevels = len(Yh_tuple)
+
+        # 경계 케이스: 청크 결합 등으로 저주파/고주파 길이가 불일치하면
+        # CPU dtcwt로 보수적인 역변환을 수행해 정확도를 우선시한다.
+        if nlevels == 1 and X.shape[2] != Yh_tuple[0].shape[2] * 2:
+            try:
+                import dtcwt
+                from dtcwt.numpy import Pyramid
+                Yl_np = X.detach().cpu().numpy()
+                Yh_np = [Yh_tuple[0].detach().cpu().numpy()]
+                t = dtcwt.Transform3d(biort=self.biort_name, qshift=self.qshift_name)
+                pyr = Pyramid(highpasses=Yh_np, lowpass=Yl_np)
+                out_np = t.inverse(pyr)
+                return out_np
+            except Exception:
+                pass
 
         for level in range(nlevels):
             if level == nlevels - 1:

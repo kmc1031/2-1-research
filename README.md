@@ -41,22 +41,23 @@
 
 ```
 research/
-├── dtcwt_cuda.py              # PyTorch 기반 CUDA GPU 가속 3D DT-CWT 구현
-├── dtcwt_processor.py         # 3D DT-CWT 핵심 모듈 (적응형 임계값, CUDA 자동 폴백, Chroma 처리)
-├── main_pipeline.py           # 읽기 → 전처리 → x264 인코딩 통합 파이프라인
-├── run_rd_curve.py            # 다중 비디오/비트레이트 RD Curve 실험 자동화
-├── run_noise_experiment.py    # ⭐ Clean vs Noisy 조건 분리 실험 (핵심 가설 검증)
-├── evaluate_metrics.py        # PSNR/SSIM/VMAF/MS-SSIM/EPSNR/PSNR-B/GBIM/MEPR 통합 측정
-├── advanced_evaluation.py     # 고급 지표 평가 및 시각화
-├── edge_analysis.py           # Sobel 에지맵 기반 EPSNR 분석
-├── compare_frames.py          # 프레임 단위 시각적 비교
-├── visualize_residuals.py     # 잔차(Residual) 시각화 도구
-├── data_loader.py             # Y4M 비디오 청크 로더 (프로토타입)
-├── test.py                    # DT-CWT 변환 왕복 일관성 테스트
-├── test_caching_math.py       # 캐싱 수학적 일관성 테스트
+├── src/dtcwt_video/
+│   ├── dtcwt_cuda.py          # PyTorch 기반 CUDA GPU 가속 3D DT-CWT 구현
+│   ├── dtcwt_processor.py     # 3D DT-CWT 핵심 모듈 (임계값, 캐싱, CPU/GPU 자동 폴백)
+│   ├── evaluate_metrics.py    # PSNR/SSIM/VMAF/MS-SSIM/EPSNR/PSNR-B/GBIM/MEPR 측정
+│   ├── advanced_evaluation.py # 고급 지표 평가 및 시각화
+│   ├── edge_analysis.py       # Sobel 에지맵 기반 EPSNR 분석
+│   ├── compare_frames.py      # 프레임 단위 시각적 비교
+│   ├── config.py, encoders.py, data_loader.py 등
+│   └── pipeline.py            # 읽기 → 전처리 → x264 인코딩 파이프라인
+├── scripts/
+│   ├── run_rd_curve.py        # 다중 비디오/비트레이트 RD Curve 실험 자동화
+│   ├── run_noise_experiment.py# ⭐ Clean vs Noisy 조건 분리 실험 (핵심 가설 검증)
+│   └── visualize_residuals.py # 잔차(Residual) 시각화 도구
+├── tests/                     # 캐싱/변환 회귀 테스트
 ├── videos/                    # 입력 비디오 (.y4m)
 ├── outputs/                   # 실험 결과물
-├── LICENSE                    # MIT License
+├── LICENSE
 └── REPRODUCIBILITY.md         # 재현 가이드 (⭐ 필독)
 ```
 
