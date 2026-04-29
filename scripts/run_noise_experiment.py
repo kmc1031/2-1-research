@@ -44,8 +44,14 @@ from dtcwt_video.dtcwt_processor import DTCWT3DProcessor
 from dtcwt_video.evaluate_metrics import evaluate_video_quality
 from dtcwt_video.encoders import (
     run_baseline_encoding, run_proposed_encoding, run_dwt3d_encoding,
-    run_nr_encoding, run_hqdn3d_encoding,
+    run_nr_encoding, run_hqdn3d_encoding, run_spatial_encoding,
+    run_lossless_copy, run_proposed_preprocess, run_dwt3d_preprocess,
+    run_hqdn3d_preprocess, run_spatial_preprocess,
     calculate_bd_rate, calculate_bd_psnr, _safe,
+)
+from dtcwt_video.experiment_analysis import (
+    RELIABLE_PRIMARY_METRICS,
+    get_actual_bitrate_kbps, summarize_method_against_baseline,
 )
 
 
@@ -120,6 +126,12 @@ def create_noisy_video(input_path, output_path, sigma, seed=42):
 # ============================================================================
 
 METRIC_NAMES = ['psnr', 'ssim', 'vmaf', 'msssim', 'epsnr', 'psnrb', 'gbim', 'mepr']
+PLOT_METRICS = [
+    ('psnr', 'PSNR-Y (dB)', 'PSNR-Y'),
+    ('msssim', 'MS-SSIM', 'MS-SSIM'),
+    ('psnrb', 'PSNR-B (dB)', 'PSNR-B'),
+    ('epsnr', 'Edge PSNR (dB)', 'EPSNR'),
+]
 
 # 사용 가능한 비교군 키 → (표시명, 인코더 함수 or None(=Proposed))
 ALL_BASELINES = {
@@ -127,13 +139,17 @@ ALL_BASELINES = {
     'nr':     ('x264 --nr',              run_nr_encoding),
     'hqdn3d': ('FFmpeg hqdn3d',          run_hqdn3d_encoding),
     'dwt':    ('3D DWT + x264',          run_dwt3d_encoding),
+    'gaussian': ('Gaussian blur + x264', run_spatial_encoding),
     'prop':   ('3D DT-CWT (Proposed)',   None),   # 항상 포함
 }
-DEFAULT_BASELINES = ['base', 'dwt']   # 기본 실행 비교군 (prop은 항상 포함)
+DEFAULT_BASELINES = ['base', 'nr', 'hqdn3d', 'dwt', 'gaussian']   # prop은 항상 포함
+PRECODEC_METHODS = ['noisy', 'hqdn3d', 'dwt', 'gaussian', 'prop']
 
 
 def run_single_condition(video_name, clean_video, input_video, sigma,
                          output_dir, bitrates, threshold, baselines=None,
+                         include_precodec_ablation: bool = True,
+                         seed: int | None = None,
                          threshold_mode: str = "adaptive",
                          controller_a: float = 0.35,
                          controller_b: float = 0.25,
@@ -161,8 +177,8 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
     """
     if baselines is None:
         baselines = DEFAULT_BASELINES
-    # prop은 항상 포함, 중복 제거
-    active_methods = list(dict.fromkeys(baselines + ['prop']))
+    # base와 prop은 항상 포함, 중복 제거
+    active_methods = list(dict.fromkeys(['base'] + baselines + ['prop']))
 
     condition = "Clean" if sigma == 0 else f"σ={sigma}"
     print(f"\n{'=' * 60}")
@@ -173,9 +189,28 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
     results = {
         'video': video_name, 'sigma': sigma, 'bitrates': bitrates,
         'active_methods': active_methods,
+        'actual_bitrates': {method_key: [] for method_key in active_methods},
+        'rows': [],
+        'pre_metrics': {},
     }
     for method_key in active_methods:
         results[method_key] = {metric: [] for metric in METRIC_NAMES}
+
+    if include_precodec_ablation:
+        pre_metrics, pre_rows = run_precodec_ablation(
+            video_name, clean_video, input_video, sigma, output_dir,
+            threshold, seed,
+            threshold_mode=threshold_mode,
+            controller_a=controller_a,
+            controller_b=controller_b,
+            controller_c=controller_c,
+            controller_d=controller_d,
+            min_multiplier=min_multiplier,
+            max_multiplier=max_multiplier,
+            disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
+        )
+        results['pre_metrics'] = pre_metrics
+        results['rows'].extend(pre_rows)
 
     for br in bitrates:
         br_str = f"{br}k"
@@ -198,6 +233,8 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
                 run_hqdn3d_encoding(input_video, out_path, br_str)
             elif method_key == 'dwt':
                 run_dwt3d_encoding(input_video, out_path, br_str, threshold)
+            elif method_key == 'gaussian':
+                run_spatial_encoding(input_video, out_path, br_str)
             elif method_key == 'prop':
                 ctx_log = None
                 if log_context:
@@ -218,15 +255,28 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
                     disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
                     log_context_path=ctx_log,
                 )
+            results['actual_bitrates'][method_key].append(
+                get_actual_bitrate_kbps(out_path)
+            )
 
         # --- 품질 평가 (참조 = 항상 clean 원본!) ---
         print(f"  [평가] {condition} - {br_str} (참조: clean 원본)")
         for method_key in active_methods:
-            m_result = evaluate_video_quality(
-                clean_video, output_paths[method_key], num_frames_custom=60
-            )
+            m_result = evaluate_video_quality(clean_video, output_paths[method_key], num_frames_custom=60)
+            metrics = _metrics_to_dict(m_result)
             for i, name in enumerate(METRIC_NAMES):
                 results[method_key][name].append(m_result[i])
+            _append_result_row(
+                results['rows'],
+                video=video_name,
+                sigma=sigma,
+                seed=seed,
+                stage="post_x264",
+                method=method_key,
+                target_bitrate_kbps=br,
+                actual_bitrate_kbps=results['actual_bitrates'][method_key][-1],
+                metrics=metrics,
+            )
 
         # 콘솔 PSNR 요약
         psnr_parts = [
@@ -246,70 +296,149 @@ def _fmt(v):
     return f"{v:.2f}"
 
 
+def _metrics_to_dict(metric_tuple):
+    """evaluate_video_quality 튜플을 이름 기반 dict로 변환합니다."""
+    return {name: metric_tuple[i] for i, name in enumerate(METRIC_NAMES)}
+
+
+def _append_result_row(rows, *, video, sigma, seed, stage, method,
+                       target_bitrate_kbps, actual_bitrate_kbps, metrics):
+    row = {
+        "stage": stage,
+        "method": method,
+        "target_bitrate_kbps": target_bitrate_kbps,
+        "actual_bitrate_kbps": actual_bitrate_kbps,
+        "sigma": sigma,
+        "video": video,
+        "seed": seed,
+    }
+    row.update(metrics)
+    rows.append(row)
+
+
+def run_precodec_ablation(video_name, clean_video, input_video, sigma,
+                          output_dir, threshold, seed,
+                          threshold_mode: str = "adaptive",
+                          controller_a: float = 0.35,
+                          controller_b: float = 0.25,
+                          controller_c: float = 0.25,
+                          controller_d: float = 0.25,
+                          min_multiplier: float = 0.5,
+                          max_multiplier: float = 2.5,
+                          disable_rate_aware_scene_reset: bool = False):
+    """압축 전 전처리 자체의 denoising 이득을 측정합니다."""
+    pre_dir = os.path.join(output_dir, "pre_x264")
+    os.makedirs(pre_dir, exist_ok=True)
+
+    prefix = f"{video_name}_s{sigma}"
+    output_paths = {
+        "noisy": os.path.join(pre_dir, f"{prefix}_noisy.y4m"),
+        "hqdn3d": os.path.join(pre_dir, f"{prefix}_hqdn3d.y4m"),
+        "dwt": os.path.join(pre_dir, f"{prefix}_dwt.y4m"),
+        "gaussian": os.path.join(pre_dir, f"{prefix}_gaussian.y4m"),
+        "prop": os.path.join(pre_dir, f"{prefix}_prop.y4m"),
+    }
+
+    run_lossless_copy(input_video, output_paths["noisy"])
+    run_hqdn3d_preprocess(input_video, output_paths["hqdn3d"])
+    run_dwt3d_preprocess(input_video, output_paths["dwt"], threshold)
+    run_spatial_preprocess(input_video, output_paths["gaussian"])
+    run_proposed_preprocess(
+        input_video, output_paths["prop"], threshold,
+        threshold_mode=threshold_mode,
+        controller_a=controller_a,
+        controller_b=controller_b,
+        controller_c=controller_c,
+        controller_d=controller_d,
+        min_multiplier=min_multiplier,
+        max_multiplier=max_multiplier,
+        disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
+    )
+
+    pre_metrics = {}
+    rows = []
+    print(f"  [Pre-x264 평가] {video_name} σ={sigma} (참조: clean 원본)")
+    for method in PRECODEC_METHODS:
+        metrics = _metrics_to_dict(
+            evaluate_video_quality(clean_video, output_paths[method], num_frames_custom=60)
+        )
+        pre_metrics[method] = metrics
+        _append_result_row(
+            rows,
+            video=video_name,
+            sigma=sigma,
+            seed=seed,
+            stage="pre_x264",
+            method=method,
+            target_bitrate_kbps="",
+            actual_bitrate_kbps="",
+            metrics=metrics,
+        )
+
+    return pre_metrics, rows
+
+
 # ============================================================================
 #  결과 요약 및 저장
 # ============================================================================
 
 def compute_condition_summary(results):
-    """단일 조건의 BD-Rate/BD-PSNR을 계산합니다.
-
-    항상 'prop' vs 'base' 기준으로 BD-Rate를 계산합니다.
-    'dwt', 'nr', 'hqdn3d'는 존재할 경우 추가로 계산합니다.
-    """
+    """단일 조건의 pre/post delta, codec gain, BD-Rate를 계산합니다."""
     bitrates = results['bitrates']
     active = results.get('active_methods', ['base', 'dwt', 'prop'])
-    nan_list = [float('nan')] * len(bitrates)
+    pre_metrics = results.get('pre_metrics', {})
+    pre_base = pre_metrics.get('noisy')
+    base_metrics = results['base']
+    base_actual = results.get('actual_bitrates', {}).get('base', bitrates)
 
-    base_psnrs = _safe(results['base']['psnr']) if 'base' in active else nan_list
-    prop_psnrs = _safe(results['prop']['psnr']) if 'prop' in active else nan_list
-    base_vmafs = _safe(results['base']['vmaf']) if 'base' in active else nan_list
-    prop_vmafs = _safe(results['prop']['vmaf']) if 'prop' in active else nan_list
+    summary = {}
+    for method_key in active:
+        if method_key == 'base':
+            continue
+        method_summary = summarize_method_against_baseline(
+            bitrates,
+            base_actual,
+            results.get('actual_bitrates', {}).get(method_key, bitrates),
+            base_metrics,
+            results[method_key],
+            pre_base,
+            pre_metrics.get(method_key),
+        )
+        summary[method_key] = method_summary
 
-    summary = {
-        'bd_rate_psnr_prop': calculate_bd_rate(bitrates, base_psnrs, bitrates, prop_psnrs),
-        'bd_rate_vmaf_prop': calculate_bd_rate(bitrates, base_vmafs, bitrates, prop_vmafs),
-        'bd_psnr_prop':      calculate_bd_psnr(bitrates, base_psnrs, bitrates, prop_psnrs),
-    }
-
-    # 선택적 비교군
-    for method_key in ['dwt', 'nr', 'hqdn3d']:
-        if method_key in active:
-            m_psnrs = _safe(results[method_key]['psnr'])
-            m_vmafs = _safe(results[method_key]['vmaf'])
-            summary[f'bd_rate_psnr_{method_key}'] = calculate_bd_rate(
-                bitrates, base_psnrs, bitrates, m_psnrs)
-            summary[f'bd_rate_vmaf_{method_key}'] = calculate_bd_rate(
-                bitrates, base_vmafs, bitrates, m_vmafs)
-        else:
-            summary[f'bd_rate_psnr_{method_key}'] = float('nan')
-            summary[f'bd_rate_vmaf_{method_key}'] = float('nan')
-
+    # Backward-compatible aliases for existing plotting/console code.
+    prop = summary.get('prop', {})
+    summary['bd_rate_psnr_prop'] = prop.get('bd_rate_psnr', float('nan'))
+    summary['bd_rate_msssim_prop'] = prop.get('bd_rate_msssim', float('nan'))
+    summary['bd_rate_vmaf_prop'] = prop.get('bd_rate_vmaf', float('nan'))  # supplementary
+    summary['bd_psnr_prop'] = calculate_bd_psnr(
+        base_actual, _safe(base_metrics.get('psnr', [])),
+        results.get('actual_bitrates', {}).get('prop', bitrates),
+        _safe(results.get('prop', {}).get('psnr', [])),
+    ) if 'prop' in active else float('nan')
+    for method_key in ['dwt', 'nr', 'hqdn3d', 'gaussian']:
+        method_summary = summary.get(method_key, {})
+        summary[f'bd_rate_psnr_{method_key}'] = method_summary.get('bd_rate_psnr', float('nan'))
+        summary[f'bd_rate_msssim_{method_key}'] = method_summary.get('bd_rate_msssim', float('nan'))
+        summary[f'bd_rate_vmaf_{method_key}'] = method_summary.get('bd_rate_vmaf', float('nan'))  # supplementary
     return summary
 
 
 def save_condition_csv(results, output_dir):
-    """단일 조건의 raw data를 CSV로 저장합니다."""
+    """단일 조건의 pre/post long-form raw data를 CSV로 저장합니다."""
     video = results['video']
     sigma = results['sigma']
-    active = results.get('active_methods', ['base', 'dwt', 'prop'])
     csv_path = os.path.join(output_dir, f"raw_data_{video}_s{sigma}.csv")
+    fieldnames = [
+        "stage", "method", "target_bitrate_kbps", "actual_bitrate_kbps",
+        "sigma", "video", "seed", *METRIC_NAMES,
+    ]
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        # 헤더: 활성 비교군만
-        header = ['Bitrate(kbps)']
-        for metric in METRIC_NAMES:
-            for method_key in active:
-                label = method_key.upper()
-                header.append(f'{label}_{metric.upper()}')
-        writer.writerow(header)
-
-        for i, br in enumerate(results['bitrates']):
-            row = [br]
-            for metric in METRIC_NAMES:
-                for method_key in active:
-                    row.append(results[method_key][metric][i])
-            writer.writerow(row)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results.get('rows', []):
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
 
     print(f"  💾 CSV 저장: {csv_path}")
 
@@ -320,32 +449,39 @@ def save_condition_csv(results, output_dir):
 # ============================================================================
 
 def plot_condition_rd_curves(results, summary, output_dir):
-    """단일 조건의 PSNR/VMAF RD Curve를 생성합니다."""
+    """단일 조건의 신뢰도 높은 full-reference RD Curve를 생성합니다."""
     video = results['video']
     sigma = results['sigma']
-    bitrates = results['bitrates']
+    active = results.get('active_methods', ['base', 'dwt', 'prop'])
     condition_label = "Clean" if sigma == 0 else f"Noisy (σ={sigma})"
+    colors = {
+        'base': '#4c72b0', 'nr': '#8172b3', 'hqdn3d': '#55a868',
+        'dwt': '#dd8452', 'gaussian': '#937860', 'prop': '#c44e52',
+    }
+    markers = {
+        'base': 'o', 'nr': 'v', 'hqdn3d': 'P',
+        'dwt': 's', 'gaussian': '^', 'prop': 'D',
+    }
 
-    for metric_key, ylabel, metric_name in [
-        ('psnr', 'PSNR (dB)', 'PSNR'),
-        ('vmaf', 'VMAF Score', 'VMAF'),
-    ]:
+    for metric_key, ylabel, metric_name in PLOT_METRICS:
         bd_key = f'bd_rate_{metric_key}_prop'
-        bd_val = summary[bd_key]
+        bd_val = summary.get(bd_key, float('nan'))
         bd_str = f"{bd_val:.2f}%" if not np.isnan(bd_val) else "N/A"
 
         plt.figure(figsize=(8, 6))
-        plt.plot(bitrates, _safe(results['base'][metric_key]),
-                 marker='o', linestyle='-', label='Baseline (x264)', color='#4c72b0')
-        plt.plot(bitrates, _safe(results['dwt'][metric_key]),
-                 marker='s', linestyle='-.', label='3D DWT + x264', color='#dd8452')
-        plt.plot(bitrates, _safe(results['prop'][metric_key]),
-                 marker='D', linestyle='-', label='3D DT-CWT + x264', color='#c44e52',
-                 linewidth=2)
+        for method_key in active:
+            x_values = results.get('actual_bitrates', {}).get(method_key, results['bitrates'])
+            label = ALL_BASELINES[method_key][0]
+            linewidth = 2.2 if method_key == 'prop' else 1.4
+            linestyle = '--' if method_key == 'base' else '-'
+            plt.plot(x_values, _safe(results[method_key][metric_key]),
+                     marker=markers.get(method_key, 'o'), linestyle=linestyle,
+                     label=label, color=colors.get(method_key),
+                     linewidth=linewidth)
 
         plt.title(f"{metric_name} RD Curve | {video.upper()} [{condition_label}]\n"
                   f"BD-Rate (Proposed vs Baseline): {bd_str}", fontsize=13)
-        plt.xlabel("Bitrate (kbps)", fontsize=12)
+        plt.xlabel("Actual Bitrate (kbps)", fontsize=12)
         plt.ylabel(ylabel, fontsize=12)
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.legend(fontsize=11)
@@ -368,28 +504,29 @@ def plot_overlay_rd_curves(all_results, output_dir):
 
     for video in all_results:
         for metric_key, ylabel, metric_name in [
-            ('psnr', 'PSNR (dB)', 'PSNR'),
-            ('vmaf', 'VMAF Score', 'VMAF'),
+            ('psnr', 'PSNR-Y (dB)', 'PSNR-Y'),
+            ('msssim', 'MS-SSIM', 'MS-SSIM'),
         ]:
             plt.figure(figsize=(10, 7))
 
             for sigma in sorted(all_results[video].keys()):
                 results = all_results[video][sigma]
-                bitrates = results['bitrates']
                 color = sigma_colors.get(sigma, '#8c8c8c')
                 label = sigma_labels.get(sigma, f'σ={sigma}')
 
                 # Baseline: 점선, Proposed: 실선
-                plt.plot(bitrates, _safe(results['base'][metric_key]),
+                plt.plot(results.get('actual_bitrates', {}).get('base', results['bitrates']),
+                         _safe(results['base'][metric_key]),
                          marker='o', linestyle='--', color=color, alpha=0.5,
                          label=f'{label} Baseline', markersize=5)
-                plt.plot(bitrates, _safe(results['prop'][metric_key]),
+                plt.plot(results.get('actual_bitrates', {}).get('prop', results['bitrates']),
+                         _safe(results['prop'][metric_key]),
                          marker='D', linestyle='-', color=color, linewidth=2,
                          label=f'{label} Proposed', markersize=6)
 
             plt.title(f"{metric_name} RD Curves | {video.upper()} | All Noise Conditions\n"
                       f"(실선=Proposed, 점선=Baseline)", fontsize=13)
-            plt.xlabel("Bitrate (kbps)", fontsize=12)
+            plt.xlabel("Actual Bitrate (kbps)", fontsize=12)
             plt.ylabel(ylabel, fontsize=12)
             plt.grid(True, linestyle='--', alpha=0.7)
             plt.legend(fontsize=9, ncol=2, loc='lower right')
@@ -417,7 +554,7 @@ def plot_bd_rate_comparison(all_summaries, output_dir):
 
     for metric_idx, (metric_key, title) in enumerate([
         ('bd_rate_psnr_prop', 'BD-Rate (PSNR) — Proposed vs Baseline'),
-        ('bd_rate_vmaf_prop', 'BD-Rate (VMAF) — Proposed vs Baseline'),
+        ('bd_rate_msssim_prop', 'BD-Rate (MS-SSIM) — Proposed vs Baseline'),
     ]):
         ax = axes[metric_idx]
         x = np.arange(len(sigmas))
@@ -457,7 +594,7 @@ def plot_bd_rate_comparison(all_summaries, output_dir):
 
     for idx, (metric_key, title, cmap) in enumerate([
         ('bd_rate_psnr_prop', 'BD-Rate PSNR (%) — Proposed vs Baseline', 'RdYlGn_r'),
-        ('bd_rate_vmaf_prop', 'BD-Rate VMAF (%) — Proposed vs Baseline', 'RdYlGn_r'),
+        ('bd_rate_msssim_prop', 'BD-Rate MS-SSIM (%) — Proposed vs Baseline', 'RdYlGn_r'),
     ]):
         ax = axes[idx]
         data = []
@@ -558,60 +695,152 @@ def plot_delta_psnr_trend(all_results, output_dir):
     print(f"  📊 ΔPSNR 트렌드 차트 저장 완료")
 
 
+def plot_pre_post_delta_bars(all_summaries, output_dir):
+    """Proposed의 pre/post ΔPSNR을 조건별로 비교합니다."""
+    labels, pre_vals, post_vals = [], [], []
+    for video in all_summaries:
+        for sigma in sorted(all_summaries[video].keys()):
+            prop = all_summaries[video][sigma].get('prop', {})
+            labels.append(f"{video}\n{'clean' if sigma == 0 else f's{sigma}'}")
+            pre_vals.append(prop.get('pre_delta_psnr', float('nan')))
+            post_vals.append(prop.get('post_delta_psnr', float('nan')))
+
+    if not labels:
+        return
+
+    x = np.arange(len(labels))
+    width = 0.38
+    plt.figure(figsize=(max(8, len(labels) * 0.8), 6))
+    plt.bar(x - width / 2, pre_vals, width, label='Pre-x264 ΔPSNR')
+    plt.bar(x + width / 2, post_vals, width, label='Post-x264 ΔPSNR')
+    plt.axhline(0, color='gray', linewidth=1)
+    plt.ylabel('ΔPSNR vs baseline/noisy input (dB)')
+    plt.title('Pre vs Post x264 Proposed Gain')
+    plt.xticks(x, labels, rotation=0)
+    plt.grid(axis='y', linestyle='--', alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "pre_post_delta_psnr.png"), dpi=300)
+    plt.close()
+    print(f"  📊 Pre/Post ΔPSNR 막대그래프 저장 완료")
+
+
+def plot_codec_gain_heatmap(all_summaries, output_dir):
+    """Codec gain = post Δ - pre Δ 히트맵을 생성합니다."""
+    videos = list(all_summaries.keys())
+    sigmas = sorted(set(s for v in all_summaries.values() for s in v.keys()))
+    if not videos or not sigmas:
+        return
+
+    data = np.array([
+        [
+            all_summaries[video].get(sigma, {}).get('prop', {}).get(
+                'codec_gain_psnr', float('nan')
+            )
+            for sigma in sigmas
+        ]
+        for video in videos
+    ])
+
+    vmax = np.nanmax(np.abs(data)) if not np.all(np.isnan(data)) else 1.0
+    vmax = max(vmax, 0.1)
+    plt.figure(figsize=(max(7, len(sigmas) * 1.4), max(3, len(videos) * 0.7 + 2)))
+    im = plt.imshow(data, cmap='RdYlGn', aspect='auto', vmin=-vmax, vmax=vmax)
+    plt.xticks(range(len(sigmas)), ["Clean" if s == 0 else f"σ={s}" for s in sigmas])
+    plt.yticks(range(len(videos)), [v.capitalize() for v in videos])
+    plt.title("Codec Gain Heatmap (Post ΔPSNR - Pre ΔPSNR)")
+    for i in range(len(videos)):
+        for j in range(len(sigmas)):
+            val = data[i, j]
+            if not np.isnan(val):
+                plt.text(j, i, f"{val:+.2f}", ha='center', va='center',
+                         color='white' if abs(val) > vmax * 0.45 else 'black')
+    plt.colorbar(im, label='Codec gain (dB)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "codec_gain_heatmap.png"), dpi=300)
+    plt.close()
+    print(f"  📊 Codec gain 히트맵 저장 완료")
+
+
 def save_summary_csv(all_summaries, output_dir):
-    """전체 실험 BD-Rate 요약을 CSV로 저장합니다."""
+    """전체 실험 요약을 method별 long-form CSV로 저장합니다."""
     csv_path = os.path.join(output_dir, "summary_bd_rates.csv")
+    fieldnames = ['Video', 'Sigma', 'Method']
+    for metric in [*RELIABLE_PRIMARY_METRICS, 'ssim', 'gbim', 'mepr', 'vmaf']:
+        fieldnames.extend([
+            f'pre_delta_{metric}', f'post_delta_{metric}', f'codec_gain_{metric}',
+            f'bd_rate_{metric}', f'mean_delta_{metric}',
+            f'low_bitrate_delta_{metric}', f'win_rate_{metric}',
+        ])
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            'Video', 'Sigma',
-            'BD-Rate_PSNR_Prop(%)', 'BD-Rate_VMAF_Prop(%)',
-            'BD-Rate_PSNR_DWT(%)', 'BD-Rate_VMAF_DWT(%)',
-            'BD-PSNR_Prop(dB)', 'BD-PSNR_DWT(dB)',
-        ])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
         for video in all_summaries:
             for sigma in sorted(all_summaries[video].keys()):
-                s = all_summaries[video][sigma]
-                writer.writerow([
-                    video, sigma,
-                    f"{s['bd_rate_psnr_prop']:.3f}",
-                    f"{s['bd_rate_vmaf_prop']:.3f}",
-                    f"{s['bd_rate_psnr_dwt']:.3f}",
-                    f"{s['bd_rate_vmaf_dwt']:.3f}",
-                    f"{s['bd_psnr_prop']:.3f}",
-                    f"{s['bd_psnr_dwt']:.3f}",
-                ])
+                for method, values in all_summaries[video][sigma].items():
+                    if not isinstance(values, dict) or not values:
+                        continue
+                    row = {'Video': video, 'Sigma': sigma, 'Method': method}
+                    row.update(values)
+                    writer.writerow({key: row.get(key, "") for key in fieldnames})
 
     print(f"\n  💾 요약 CSV 저장: {csv_path}")
+    return csv_path
+
+
+def save_reliable_metrics_csv(all_summaries, output_dir):
+    """VMAF를 제외한 headline 지표만 별도 CSV로 저장합니다."""
+    csv_path = os.path.join(output_dir, "summary_reliable_metrics.csv")
+    metrics = [*RELIABLE_PRIMARY_METRICS, 'ssim', 'gbim', 'mepr']
+    fieldnames = ['Video', 'Sigma', 'Method']
+    for metric in metrics:
+        fieldnames.extend([
+            f'pre_delta_{metric}', f'post_delta_{metric}',
+            f'codec_gain_{metric}', f'win_rate_{metric}',
+        ])
+
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for video in all_summaries:
+            for sigma in sorted(all_summaries[video].keys()):
+                for method, values in all_summaries[video][sigma].items():
+                    if not isinstance(values, dict) or not values:
+                        continue
+                    row = {'Video': video, 'Sigma': sigma, 'Method': method}
+                    row.update(values)
+                    writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    print(f"  💾 신뢰 지표 요약 CSV 저장: {csv_path}")
     return csv_path
 
 
 def print_summary_table(all_summaries):
     """콘솔에 BD-Rate 요약 테이블을 출력합니다."""
     print(f"\n{'=' * 80}")
-    print(f"  📊 전체 조건별 BD-Rate 요약 (Proposed vs Baseline)")
-    print(f"  (음수 = Proposed 우수 | 양수 = Baseline 우수)")
+    print(f"  📊 전체 조건별 요약 (Proposed vs Baseline)")
+    print(f"  (BD-Rate 음수/ΔPSNR 양수 = Proposed 우수)")
     print(f"{'=' * 80}")
-    print(f"  {'Video':<12} {'σ':>4}  {'BD-Rate(PSNR)':>16}  {'BD-Rate(VMAF)':>16}  {'BD-PSNR':>10}")
-    print(f"  {'-' * 12} {'-' * 4}  {'-' * 16}  {'-' * 16}  {'-' * 10}")
+    print(f"  {'Video':<12} {'σ':>4}  {'BD-Rate(PSNR)':>16}  {'Post ΔPSNR':>12}  {'CodecGain':>12}  {'WinRate':>8}")
+    print(f"  {'-' * 12} {'-' * 4}  {'-' * 16}  {'-' * 12}  {'-' * 12}  {'-' * 8}")
 
     for video in all_summaries:
         for sigma in sorted(all_summaries[video].keys()):
-            s = all_summaries[video][sigma]
-            bd_psnr = s['bd_rate_psnr_prop']
-            bd_vmaf = s['bd_rate_vmaf_prop']
-            bd_p = s['bd_psnr_prop']
+            s = all_summaries[video][sigma].get('prop', {})
+            bd_psnr = s.get('bd_rate_psnr', float('nan'))
+            post_delta = s.get('post_delta_psnr', float('nan'))
+            codec_gain = s.get('codec_gain_psnr', float('nan'))
+            wr = s.get('win_rate_psnr', float('nan'))
 
-            # 색상 힌트 (더 좋으면 ✅, 더 나쁘면 ❌)
             emoji_p = "✅" if bd_psnr < 0 else "❌" if bd_psnr > 0 else "➖"
-            emoji_v = "✅" if bd_vmaf < 0 else "❌" if bd_vmaf > 0 else "➖"
 
             sigma_label = "clean" if sigma == 0 else f"σ={sigma}"
             print(f"  {video:<12} {sigma_label:>4}  "
                   f"{emoji_p} {bd_psnr:>+10.2f} %    "
-                  f"{emoji_v} {bd_vmaf:>+10.2f} %    "
-                  f"{bd_p:>+7.3f} dB")
+                  f"{post_delta:>+9.3f} dB  "
+                  f"{codec_gain:>+9.3f} dB  "
+                  f"{wr:>7.2f}")
         print()
 
     print(f"{'=' * 80}")
@@ -634,6 +863,10 @@ def main():
 
   전체 비디오에 대해 전체 실험:
     uv run python run_noise_experiment.py -v akiyo foreman mobile stefan
+
+  강화 비교군 + pre-x264 ablation:
+    uv run python run_noise_experiment.py -v akiyo --sigma 0 10 \
+      --baselines base nr hqdn3d dwt gaussian --include_precodec_ablation
 """,
     )
     parser.add_argument("-v", "--video_names", nargs='+',
@@ -667,12 +900,14 @@ def main():
                         help="노이즈 랜덤 시드 (기본: 42)")
     parser.add_argument("--skip_existing", action="store_true",
                         help="이미 인코딩된 파일이 있으면 건너뜀")
+    parser.add_argument("--include_precodec_ablation", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="x264 전 전처리-only ablation을 수행 (기본: 켬)")
     parser.add_argument("--baselines", nargs='+',
                         default=DEFAULT_BASELINES,
-                        choices=['base', 'nr', 'hqdn3d', 'dwt'],
+                        choices=['base', 'nr', 'hqdn3d', 'dwt', 'gaussian'],
                         help=("포함할 비교군 목록 (prop은 항상 포함됨). "
-                              "기본: base dwt. "
-                              "강화 실험: --baselines base nr hqdn3d dwt"))
+                              "기본: base nr hqdn3d dwt gaussian."))
 
     args = parser.parse_args()
 
@@ -706,14 +941,15 @@ def main():
             # 1. 노이즈 영상 생성 (σ=0이면 원본 그대로 사용)
             if sigma == 0:
                 input_video = clean_video
+                noise_seed = args.seed
             else:
                 noisy_path = os.path.join(noisy_dir, f"{video_name}_s{sigma}.y4m")
+                noise_seed = args.seed + sigma * 1000 + sum(ord(c) for c in video_name)
                 if os.path.exists(noisy_path) and args.skip_existing:
                     print(f"  ♻️ 기존 노이즈 영상 재사용: {noisy_path}")
                     input_video = noisy_path
                 else:
                     # 비디오+시그마별 고유 시드로 재현성 확보
-                    noise_seed = args.seed + sigma * 1000 + sum(ord(c) for c in video_name)
                     input_video = create_noisy_video(
                         clean_video, noisy_path, sigma, seed=noise_seed
                     )
@@ -723,6 +959,8 @@ def main():
                 video_name, clean_video, input_video, sigma,
                 args.output_dir, args.bitrates, args.threshold,
                 baselines=args.baselines,
+                include_precodec_ablation=args.include_precodec_ablation,
+                seed=noise_seed,
                 threshold_mode=args.threshold_mode,
                 controller_a=args.controller_a,
                 controller_b=args.controller_b,
@@ -744,11 +982,11 @@ def main():
 
             # BD-Rate 출력
             bd_p = summary['bd_rate_psnr_prop']
-            bd_v = summary['bd_rate_vmaf_prop']
+            bd_v = summary['bd_rate_msssim_prop']
             bd_p_str = f"{bd_p:+.2f}%" if not np.isnan(bd_p) else "N/A"
             bd_v_str = f"{bd_v:+.2f}%" if not np.isnan(bd_v) else "N/A"
             print(f"\n  📊 [{video_name.upper()} σ={sigma}] "
-                  f"BD-Rate: PSNR={bd_p_str} | VMAF={bd_v_str}")
+                  f"BD-Rate: PSNR={bd_p_str} | MS-SSIM={bd_v_str}")
 
     # 4. 전체 비교 시각화
     if all_results:
@@ -759,7 +997,10 @@ def main():
         plot_overlay_rd_curves(all_results, args.output_dir)
         plot_bd_rate_comparison(all_summaries, args.output_dir)
         plot_delta_psnr_trend(all_results, args.output_dir)
+        plot_pre_post_delta_bars(all_summaries, args.output_dir)
+        plot_codec_gain_heatmap(all_summaries, args.output_dir)
         csv_path = save_summary_csv(all_summaries, args.output_dir)
+        save_reliable_metrics_csv(all_summaries, args.output_dir)
 
         # 콘솔 요약 테이블
         print_summary_table(all_summaries)

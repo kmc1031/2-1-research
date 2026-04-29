@@ -65,7 +65,8 @@ def get_scene_changes(file_path, fps, threshold=10.0):
         "-f", "null", "-"
     ]
     process = subprocess.Popen(
-        cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, universal_newlines=True
+        cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        text=True, encoding='utf-8', errors='replace'
     )
     
     scene_frames = set()

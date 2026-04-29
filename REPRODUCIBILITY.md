@@ -3,7 +3,7 @@
 This document describes the exact steps to reproduce the experiments in this repository.
 
 > **Key caveat:** Python dependencies alone are not sufficient.
-> FFmpeg must be built with **libvmaf** support. See [FFmpeg Requirements](#2-ffmpeg-requirements) below.
+> FFmpeg must include **libx264** for encoding. **libvmaf** is recommended for MS-SSIM extraction and supplementary VMAF logging.
 
 ---
 
@@ -13,7 +13,7 @@ This document describes the exact steps to reproduce the experiments in this rep
 |---|---|
 | OS | Windows 10/11, Linux (Ubuntu 20.04+) |
 | Python | ≥ 3.12 (see `.python-version`) |
-| FFmpeg | ≥ 6.0, built with `--enable-libx264 --enable-libvmaf` |
+| FFmpeg | ≥ 6.0, built with `--enable-libx264`; `--enable-libvmaf` recommended |
 | CUDA *(optional)* | CUDA 12.6+, cuDNN compatible with PyTorch 2.x |
 | RAM | ≥ 8 GB (≥ 16 GB recommended for full pipeline) |
 | Disk | ≥ 2 GB free (video inputs + encoded outputs) |
@@ -22,18 +22,19 @@ This document describes the exact steps to reproduce the experiments in this rep
 
 ## 2. FFmpeg Requirements
 
-This project uses FFmpeg for encoding (libx264) and quality measurement (libvmaf, MS-SSIM).
+This project uses FFmpeg for encoding (libx264). MS-SSIM and supplementary VMAF logging use FFmpeg's libvmaf filter when available.
 
 ### Verify your FFmpeg has the required codecs
 
 ```bash
-ffmpeg -codecs 2>/dev/null | grep -E "libx264|libvmaf"
+ffmpeg -codecs 2>/dev/null | grep -E "libx264"
+ffmpeg -filters 2>/dev/null | grep -E "libvmaf"
 ```
 
-Expected output (must include both):
+Expected output:
 ```
 DEV.LS h264    H.264 / AVC ... (encoders: ... libx264 ...)
- ...   vmaf   VMAF (Video Multi-Method Assessment Fusion) (decoders: libvmaf ...)
+ ... libvmaf         VV->V      Calculate the VMAF between two video streams.
 ```
 
 ### If libvmaf is missing
@@ -51,7 +52,7 @@ sudo apt install ffmpeg libvmaf-dev
 # or build from source with --enable-libvmaf
 ```
 
-> **Without libvmaf:** VMAF and MS-SSIM scores will be `nan`. PSNR and SSIM will still work.
+> **Without libvmaf:** MS-SSIM and supplementary VMAF scores will be `nan`. PSNR-Y, SSIM, EPSNR, PSNR-B, GBIM, and MEPR still work.
 
 ---
 
@@ -111,7 +112,7 @@ This is the fastest way to verify the pipeline is working correctly.
 
 ```bash
 # Step 1: Verify DT-CWT transform/inverse consistency
-uv run python test.py
+uv run pytest tests/test_transform.py -q
 
 # Step 2: Run the core hypothesis experiment (clean vs noisy)
 #   - 1 video, 2 noise levels (σ=0 clean, σ=10 noisy), 3 bitrates
@@ -141,7 +142,8 @@ outputs/repro_check/
 ├── delta_psnr_akiyo.png       # ★ ΔPSNR trend (positive = Proposed wins)
 ├── raw_data_akiyo_s0.csv      # Per-bitrate metrics: clean
 ├── raw_data_akiyo_s10.csv     # Per-bitrate metrics: noisy
-└── summary_bd_rates.csv       # BD-Rate summary table
+├── summary_bd_rates.csv       # BD-Rate / delta / win-rate summary table
+└── summary_reliable_metrics.csv # PSNR/MS-SSIM/PSNR-B/EPSNR 중심 요약
 ```
 
 ### Expected Result Pattern
@@ -185,15 +187,16 @@ Open `rd_overlay_psnr_akiyo.png` and verify:
 
 ### Quantitative check
 
-Check `summary_bd_rates.csv`:
-- `BD-Rate_PSNR_Prop(%)` should be **negative** for noisy conditions
-- `BD-Rate_PSNR_Prop(%)` may be positive for clean conditions
+Check `summary_bd_rates.csv` and `summary_reliable_metrics.csv`:
+- `post_delta_psnr`, `post_delta_msssim`, `post_delta_psnrb`, and `post_delta_epsnr` should be positive for noisy conditions
+- clean conditions may be near-zero or negative
+- `codec_gain_* = post_delta_* - pre_delta_*` separates codec interaction from pure denoising benefit
 
 ### Sanity check
 
 ```bash
 # Verify transform round-trip error is near zero
-uv run python test.py
+uv run pytest tests/test_transform.py -q
 # Expected: max round-trip error < 1e-5
 ```
 
@@ -203,8 +206,8 @@ uv run python test.py
 
 | Issue | Impact | Workaround |
 |---|---|---|
-| FFmpeg without libvmaf | VMAF = `nan` | Use GPL FFmpeg build |
-| CUDA OOM on <4 GB VRAM | Falls back to CPU | Reduce `chunk_size` in `main_pipeline.py` |
+| FFmpeg without libvmaf | MS-SSIM/supplementary VMAF = `nan` | Use GPL FFmpeg build, or rely on PSNR/SSIM/EPSNR/PSNR-B |
+| CUDA OOM on <4 GB VRAM | Falls back to CPU | Reduce `chunk_size` in the pipeline/experiment CLI |
 | BD-Rate requires ≥4 bitrate points | Returns `nan` with fewer points | Use ≥4 bitrates with `-b` flag |
 | akiyo has low motion → small gains | Low-motion scenes are already efficient | Use `foreman` or `stefan` for stronger results |
 
@@ -219,4 +222,4 @@ uv run python test.py
 | RAM | — |
 | OS | Windows 11 |
 | Python | 3.12 |
-| FFmpeg | GPL build with libvmaf |
+| FFmpeg | GPL build with libx264/libvmaf |

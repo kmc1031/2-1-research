@@ -22,6 +22,7 @@ import subprocess
 import csv
 
 import cv2
+import ffmpeg
 import numpy as np
 
 from dtcwt_video.pipeline import get_video_metadata, read_y4m_and_split, create_x264_encoder, build_processing_context
@@ -29,6 +30,30 @@ from dtcwt_video.dtcwt_processor import DTCWT3DProcessor
 
 
 # ─── 인코딩 함수 ───────────────────────────────────────────────────────────────
+
+def create_y4m_writer(output_path: str, width: int, height: int, fps: float):
+    """Create an FFmpeg process that writes raw yuv420p frames as Y4M."""
+    return (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='yuv420p',
+               s=f'{width}x{height}', framerate=fps)
+        .output(output_path, pix_fmt='yuv420p', format='yuv4mpegpipe')
+        .overwrite_output()
+        .global_args('-loglevel', 'quiet')
+        .run_async(pipe_stdin=True)
+    )
+
+
+def run_lossless_copy(input_video: str, output_video: str) -> None:
+    """Write a Y4M copy for the noisy pre-x264 reference row."""
+    print(f"  [Pre noisy] 원본 입력을 Y4M으로 정규화 중...")
+    cmd = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-pix_fmt", "yuv420p",
+        "-f", "yuv4mpegpipe",
+        output_video,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def run_baseline_encoding(input_video: str, output_video: str, bitrate: str) -> None:
     """FFmpeg를 사용해 전처리 없이 바로 x264로 압축하는 베이스라인을 생성합니다."""
@@ -39,6 +64,24 @@ def run_baseline_encoding(input_video: str, output_video: str, bitrate: str) -> 
         "-b:v", bitrate,
         "-preset", "fast",
         "-tune", "zerolatency",
+        output_video,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run_hqdn3d_preprocess(input_video: str, output_video: str,
+                          luma_spatial: float = 4.0, luma_temporal: float = 3.0,
+                          chroma_spatial: float = 3.0, chroma_temporal: float = 2.5) -> None:
+    """Apply hqdn3d only and save a lossless Y4M pre-x264 artifact."""
+    print(f"  [Pre hqdn3d] 전처리-only Y4M 생성 중...")
+    hqdn3d_filter = (
+        f"hqdn3d={luma_spatial}:{chroma_spatial}:{luma_temporal}:{chroma_temporal}"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-vf", hqdn3d_filter,
+        "-pix_fmt", "yuv420p",
+        "-f", "yuv4mpegpipe",
         output_video,
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -137,6 +180,33 @@ def run_spatial_encoding(input_video: str, output_video: str, bitrate: str,
     encoder_process.wait()
 
 
+def run_spatial_preprocess(input_video: str, output_video: str,
+                           max_frames: float = float('inf')) -> None:
+    """Apply Gaussian prefilter only and save a Y4M artifact."""
+    print(f"  [Pre Gaussian] 전처리-only Y4M 생성 중...")
+    w, h, fps = get_video_metadata(input_video)
+    writer = create_y4m_writer(output_video, w, h, fps)
+
+    total_processed_frames = 0
+    for y_array, u_np, v_np, frames, _ in read_y4m_and_split(
+        input_video, w, h, fps=fps, chunk_size=8, overlap=0, scene_threshold=100.0
+    ):
+        if total_processed_frames >= max_frames:
+            break
+
+        y_uint8 = (y_array * 255.0).clip(0, 255).astype(np.uint8)
+        for f in range(frames):
+            blurred_y = cv2.GaussianBlur(y_uint8[f], (5, 5), 1.5).flatten()
+            writer.stdin.write(blurred_y.tobytes())
+            writer.stdin.write(u_np[f].tobytes())
+            writer.stdin.write(v_np[f].tobytes())
+
+        total_processed_frames += frames
+
+    writer.stdin.close()
+    writer.wait()
+
+
 def run_dwt3d_encoding(input_video: str, output_video: str, bitrate: str,
                         threshold: float = 0.03,
                         max_frames: float = float('inf')) -> None:
@@ -191,6 +261,52 @@ def run_dwt3d_encoding(input_video: str, output_video: str, bitrate: str,
 
     encoder_process.stdin.close()
     encoder_process.wait()
+
+
+def run_dwt3d_preprocess(input_video: str, output_video: str,
+                         threshold: float = 0.03,
+                         max_frames: float = float('inf')) -> None:
+    """Apply 3D DWT only and save a Y4M artifact."""
+    print(f"  [Pre DWT3D] 전처리-only Y4M 생성 중 (T={threshold})...")
+    w, h, fps = get_video_metadata(input_video)
+    writer = create_y4m_writer(output_video, w, h, fps)
+
+    try:
+        import pywt
+    except ImportError:
+        print("  [에러] PyWavelets 패키지가 없습니다. 원본 그대로 저장합니다.")
+        pywt = None
+
+    total_processed_frames = 0
+    for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
+        input_video, w, h, fps=fps, chunk_size=8, overlap=4
+    ):
+        if total_processed_frames >= max_frames:
+            break
+
+        if pywt is not None:
+            coeffs = pywt.dwtn(y_array, 'haar')
+            shrunk_coeffs = {
+                k: v if k == 'aaa' else pywt.threshold(v, threshold, mode='soft')
+                for k, v in coeffs.items()
+            }
+            processed_y = pywt.idwtn(shrunk_coeffs, 'haar')
+        else:
+            processed_y = y_array
+
+        processed_y_valid = processed_y[overlap_len:overlap_len + frames]
+        processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
+        processed_y_flat = processed_y_uint8.reshape((frames, -1))
+
+        for f in range(frames):
+            writer.stdin.write(processed_y_flat[f].tobytes())
+            writer.stdin.write(u_np[f].tobytes())
+            writer.stdin.write(v_np[f].tobytes())
+
+        total_processed_frames += frames
+
+    writer.stdin.close()
+    writer.wait()
 
 
 def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
@@ -305,6 +421,76 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
     encoder_process.wait()
     if log_writer:
         log_fp.close()
+
+
+def run_proposed_preprocess(input_video: str, output_video: str,
+                            threshold: float,
+                            max_frames: float = float('inf'),
+                            disable_overlap: bool = False,
+                            disable_adaptive: bool = False,
+                            threshold_mode: str = "adaptive",
+                            controller_a: float = 0.35,
+                            controller_b: float = 0.25,
+                            controller_c: float = 0.25,
+                            controller_d: float = 0.25,
+                            min_multiplier: float = 0.5,
+                            max_multiplier: float = 2.5,
+                            disable_rate_aware_scene_reset: bool = False) -> None:
+    """Apply 3D DT-CWT only and save a Y4M artifact."""
+    print(f"  [Pre Proposed] 전처리-only Y4M 생성 중 (T={threshold}, mode={threshold_mode})...")
+    w, h, fps = get_video_metadata(input_video)
+    writer = create_y4m_writer(output_video, w, h, fps)
+
+    adaptive = not disable_adaptive
+    processor = DTCWT3DProcessor(
+        threshold=threshold,
+        adaptive_threshold=adaptive,
+        threshold_mode=threshold_mode if not disable_adaptive else "fixed",
+        controller_a=controller_a,
+        controller_b=controller_b,
+        controller_c=controller_c,
+        controller_d=controller_d,
+        min_multiplier=min_multiplier,
+        max_multiplier=max_multiplier,
+        disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
+    )
+
+    overlap_frames = 0 if disable_overlap else 4
+    total_processed_frames = 0
+    chunk_idx = 0
+    for y_array, u_np, v_np, frames, overlap_len, scene_cut in read_y4m_and_split(
+        input_video, w, h, fps=fps, chunk_size=8, overlap=overlap_frames,
+        return_scene_change=True
+    ):
+        if total_processed_frames >= max_frames:
+            break
+
+        if threshold_mode == "rate_aware":
+            ctx, _ = build_processing_context(
+                y_array, "800k", chunk_idx, fps, scene_cut, threshold_mode
+            )
+            processor.set_context(ctx)
+        else:
+            processor.set_context(None)
+
+        processed_y = processor.process_chunk(y_array, overlap_len=overlap_len)
+        processed_y_valid = processed_y[overlap_len:overlap_len + frames]
+        valid_frames = processed_y_valid.shape[0]
+        processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
+        processed_y_flat = processed_y_uint8.reshape((valid_frames, -1))
+
+        u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
+
+        for f in range(valid_frames):
+            writer.stdin.write(processed_y_flat[f].tobytes())
+            writer.stdin.write(u_proc[f].tobytes())
+            writer.stdin.write(v_proc[f].tobytes())
+
+        total_processed_frames += valid_frames
+        chunk_idx += 1
+
+    writer.stdin.close()
+    writer.wait()
 
 
 # ─── BD-Rate / BD-PSNR ────────────────────────────────────────────────────────
