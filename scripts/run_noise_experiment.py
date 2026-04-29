@@ -149,6 +149,11 @@ PRECODEC_METHODS = ['noisy', 'hqdn3d', 'dwt', 'gaussian', 'prop']
 def run_single_condition(video_name, clean_video, input_video, sigma,
                          output_dir, bitrates, threshold, baselines=None,
                          include_precodec_ablation: bool = True,
+                         reuse_preprocessed: bool = True,
+                         skip_existing_outputs: bool = False,
+                         chunk_size: int = 16,
+                         overlap: int = 4,
+                         process_chroma: bool = False,
                          seed: int | None = None,
                          threshold_mode: str = "adaptive",
                          controller_a: float = 0.35,
@@ -192,14 +197,20 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
         'actual_bitrates': {method_key: [] for method_key in active_methods},
         'rows': [],
         'pre_metrics': {},
+        'preprocessed_paths': {},
+        'artifacts': [],
     }
     for method_key in active_methods:
         results[method_key] = {metric: [] for metric in METRIC_NAMES}
 
     if include_precodec_ablation:
-        pre_metrics, pre_rows = run_precodec_ablation(
+        pre_metrics, pre_rows, preprocessed_paths = run_precodec_ablation(
             video_name, clean_video, input_video, sigma, output_dir,
             threshold, seed,
+            skip_existing_outputs=skip_existing_outputs,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            process_chroma=process_chroma,
             threshold_mode=threshold_mode,
             controller_a=controller_a,
             controller_b=controller_b,
@@ -210,7 +221,15 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
             disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
         )
         results['pre_metrics'] = pre_metrics
+        results['preprocessed_paths'] = preprocessed_paths
+        results['artifacts'].extend(preprocessed_paths.values())
         results['rows'].extend(pre_rows)
+
+    preprocessed_inputs = _select_reusable_preprocessed_inputs(
+        results.get('preprocessed_paths', {}),
+        threshold_mode=threshold_mode,
+        reuse_preprocessed=reuse_preprocessed,
+    )
 
     for br in bitrates:
         br_str = f"{br}k"
@@ -221,20 +240,28 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
             method_key: os.path.join(output_dir, f"{prefix}_{method_key}_{br_str}.mp4")
             for method_key in active_methods
         }
+        results['artifacts'].extend(output_paths.values())
 
         # --- 인코딩 ---
         for method_key in active_methods:
             out_path = output_paths[method_key]
-            if method_key == 'base':
+            if skip_existing_outputs and os.path.exists(out_path):
+                print(f"  [Skip]    기존 인코딩 재사용: {out_path}")
+            elif method_key in preprocessed_inputs:
+                run_baseline_encoding(preprocessed_inputs[method_key], out_path, br_str)
+            elif method_key == 'base':
                 run_baseline_encoding(input_video, out_path, br_str)
             elif method_key == 'nr':
                 run_nr_encoding(input_video, out_path, br_str)
             elif method_key == 'hqdn3d':
                 run_hqdn3d_encoding(input_video, out_path, br_str)
             elif method_key == 'dwt':
-                run_dwt3d_encoding(input_video, out_path, br_str, threshold)
+                run_dwt3d_encoding(
+                    input_video, out_path, br_str, threshold,
+                    chunk_size=chunk_size, overlap=overlap,
+                )
             elif method_key == 'gaussian':
-                run_spatial_encoding(input_video, out_path, br_str)
+                run_spatial_encoding(input_video, out_path, br_str, chunk_size=chunk_size)
             elif method_key == 'prop':
                 ctx_log = None
                 if log_context:
@@ -245,6 +272,9 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
                     )
                 run_proposed_encoding(
                     input_video, out_path, br_str, threshold,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                    process_chroma=process_chroma,
                     threshold_mode=threshold_mode,
                     controller_a=controller_a,
                     controller_b=controller_b,
@@ -288,6 +318,30 @@ def run_single_condition(video_name, clean_video, input_video, sigma,
     return results
 
 
+def _select_reusable_preprocessed_inputs(preprocessed_paths: dict[str, str], *,
+                                         threshold_mode: str,
+                                         reuse_preprocessed: bool) -> dict[str, str]:
+    """Return preprocessing artifacts that can be reused for all bitrates.
+
+    In fixed/adaptive modes, proposed preprocessing is bitrate-independent.
+    In rate-aware mode, proposed depends on target bitrate, so only non-proposed
+    baseline prefilters are safely reusable.
+    """
+    if not reuse_preprocessed:
+        return {}
+
+    reusable = {
+        method: path
+        for method, path in preprocessed_paths.items()
+        if method in {"hqdn3d", "dwt", "gaussian"} and os.path.exists(path)
+    }
+    if threshold_mode != "rate_aware":
+        prop_path = preprocessed_paths.get("prop")
+        if prop_path and os.path.exists(prop_path):
+            reusable["prop"] = prop_path
+    return reusable
+
+
 
 def _fmt(v):
     """숫자를 안전하게 포맷합니다 (nan 처리)."""
@@ -318,6 +372,10 @@ def _append_result_row(rows, *, video, sigma, seed, stage, method,
 
 def run_precodec_ablation(video_name, clean_video, input_video, sigma,
                           output_dir, threshold, seed,
+                          skip_existing_outputs: bool = False,
+                          chunk_size: int = 16,
+                          overlap: int = 4,
+                          process_chroma: bool = False,
                           threshold_mode: str = "adaptive",
                           controller_a: float = 0.35,
                           controller_b: float = 0.25,
@@ -339,12 +397,23 @@ def run_precodec_ablation(video_name, clean_video, input_video, sigma,
         "prop": os.path.join(pre_dir, f"{prefix}_prop.y4m"),
     }
 
-    run_lossless_copy(input_video, output_paths["noisy"])
-    run_hqdn3d_preprocess(input_video, output_paths["hqdn3d"])
-    run_dwt3d_preprocess(input_video, output_paths["dwt"], threshold)
-    run_spatial_preprocess(input_video, output_paths["gaussian"])
-    run_proposed_preprocess(
+    _run_or_reuse(skip_existing_outputs, output_paths["noisy"],
+                  run_lossless_copy, input_video, output_paths["noisy"])
+    _run_or_reuse(skip_existing_outputs, output_paths["hqdn3d"],
+                  run_hqdn3d_preprocess, input_video, output_paths["hqdn3d"])
+    _run_or_reuse(skip_existing_outputs, output_paths["dwt"],
+                  run_dwt3d_preprocess, input_video, output_paths["dwt"], threshold,
+                  chunk_size=chunk_size, overlap=overlap)
+    _run_or_reuse(skip_existing_outputs, output_paths["gaussian"],
+                  run_spatial_preprocess, input_video, output_paths["gaussian"],
+                  chunk_size=chunk_size)
+    _run_or_reuse(
+        skip_existing_outputs, output_paths["prop"],
+        run_proposed_preprocess,
         input_video, output_paths["prop"], threshold,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        process_chroma=process_chroma,
         threshold_mode=threshold_mode,
         controller_a=controller_a,
         controller_b=controller_b,
@@ -375,7 +444,39 @@ def run_precodec_ablation(video_name, clean_video, input_video, sigma,
             metrics=metrics,
         )
 
-    return pre_metrics, rows
+    return pre_metrics, rows, output_paths
+
+
+def _run_or_reuse(skip_existing: bool, output_path: str, func, *args, **kwargs):
+    """Run a producer unless the requested artifact already exists."""
+    if skip_existing and os.path.exists(output_path):
+        print(f"  [Skip]    기존 파일 재사용: {output_path}")
+        return
+    func(*args, **kwargs)
+
+
+def cleanup_condition_intermediates(results, output_dir, extra_paths=None):
+    """Remove generated video artifacts after metrics/plots are materialized."""
+    output_root = os.path.abspath(output_dir)
+    paths = list(results.get('artifacts', []))
+    if extra_paths:
+        paths.extend(extra_paths)
+
+    removed = 0
+    for path in dict.fromkeys(paths):
+        if not path:
+            continue
+        abs_path = os.path.abspath(path)
+        if not abs_path.startswith(output_root):
+            continue
+        if os.path.splitext(abs_path)[1].lower() not in {'.mp4', '.y4m', '.mkv'}:
+            continue
+        if os.path.exists(abs_path):
+            os.remove(abs_path)
+            removed += 1
+
+    if removed:
+        print(f"  🧹 중간 비디오 파일 정리: {removed}개 삭제")
 
 
 # ============================================================================
@@ -903,6 +1004,20 @@ def main():
     parser.add_argument("--include_precodec_ablation", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="x264 전 전처리-only ablation을 수행 (기본: 켬)")
+    parser.add_argument("--reuse_preprocessed", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help=("pre-x264 전처리 산출물을 post-x264 인코딩 입력으로 재사용 "
+                              "(fixed/adaptive Proposed에서 큰 폭으로 빠름, 기본: 켬)"))
+    parser.add_argument("--chunk_size", type=int, default=16,
+                        help="전처리 청크 크기. RTX 3090 권장값: 16~32 (기본: 16)")
+    parser.add_argument("--overlap", type=int, default=4,
+                        help="DT-CWT/DWT 시간축 overlap 프레임 수 (기본: 4)")
+    parser.add_argument("--process_chroma", action="store_true",
+                        help=("Proposed에서 U/V chroma도 DT-CWT 처리. "
+                              "기본은 luma-only 노이즈 실험에 맞춰 비활성화"))
+    parser.add_argument("--cleanup_intermediates", action="store_true",
+                        help=("조건별 평가가 끝난 뒤 재생성 가능한 mp4/y4m 중간 파일을 삭제. "
+                              "장시간 서버 실행 시 디스크 사용량 절감"))
     parser.add_argument("--baselines", nargs='+',
                         default=DEFAULT_BASELINES,
                         choices=['base', 'nr', 'hqdn3d', 'dwt', 'gaussian'],
@@ -922,6 +1037,8 @@ def main():
     print(f"  노이즈: σ = {args.sigma}")
     print(f"  비트레이트: {args.bitrates} kbps")
     print(f"  임계값: {args.threshold} | 모드: {args.threshold_mode}")
+    print(f"  청크: {args.chunk_size} frames | overlap: {args.overlap} | chroma DT-CWT: {args.process_chroma}")
+    print(f"  전처리 재사용: {args.reuse_preprocessed} | 기존 산출물 재사용: {args.skip_existing}")
     print(f"  비교군: {args.baselines} + prop (always)")
     print(f"{'=' * 60}")
 
@@ -960,6 +1077,11 @@ def main():
                 args.output_dir, args.bitrates, args.threshold,
                 baselines=args.baselines,
                 include_precodec_ablation=args.include_precodec_ablation,
+                reuse_preprocessed=args.reuse_preprocessed,
+                skip_existing_outputs=args.skip_existing,
+                chunk_size=args.chunk_size,
+                overlap=args.overlap,
+                process_chroma=args.process_chroma,
                 seed=noise_seed,
                 threshold_mode=args.threshold_mode,
                 controller_a=args.controller_a,
@@ -979,6 +1101,12 @@ def main():
 
             all_results[video_name][sigma] = results
             all_summaries[video_name][sigma] = summary
+
+            if args.cleanup_intermediates:
+                cleanup_extra = []
+                if sigma != 0:
+                    cleanup_extra.append(input_video)
+                cleanup_condition_intermediates(results, args.output_dir, cleanup_extra)
 
             # BD-Rate 출력
             bd_p = summary['bd_rate_psnr_prop']

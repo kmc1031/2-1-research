@@ -202,6 +202,7 @@ def create_x264_encoder(output_path, width, height, fps, bitrate='100k'):
         .output(output_path, vcodec='libx264', video_bitrate=bitrate,
                 preset='fast', tune='zerolatency')
         .overwrite_output()
+        .global_args('-loglevel', 'quiet')
         .run_async(pipe_stdin=True)
     )
     return process

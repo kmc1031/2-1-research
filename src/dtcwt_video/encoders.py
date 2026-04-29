@@ -153,7 +153,8 @@ def run_hqdn3d_encoding(input_video: str, output_video: str, bitrate: str,
 
 
 def run_spatial_encoding(input_video: str, output_video: str, bitrate: str,
-                          max_frames: float = float('inf')) -> None:
+                          max_frames: float = float('inf'),
+                          chunk_size: int = 16) -> None:
     """단순 2D 공간 필터(Gaussian Blur)를 적용한 후 x264로 압축하는 비교군을 생성합니다."""
     print(f"  [Spatial] {bitrate} 전처리 및 인코딩 중 (Gaussian Blur)...")
     w, h, fps = get_video_metadata(input_video)
@@ -161,7 +162,7 @@ def run_spatial_encoding(input_video: str, output_video: str, bitrate: str,
 
     total_processed_frames = 0
     for y_array, u_np, v_np, frames, _ in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=0, scene_threshold=100.0
+        input_video, w, h, fps=fps, chunk_size=chunk_size, overlap=0, scene_threshold=100.0
     ):
         if total_processed_frames >= max_frames:
             break
@@ -181,7 +182,8 @@ def run_spatial_encoding(input_video: str, output_video: str, bitrate: str,
 
 
 def run_spatial_preprocess(input_video: str, output_video: str,
-                           max_frames: float = float('inf')) -> None:
+                           max_frames: float = float('inf'),
+                           chunk_size: int = 16) -> None:
     """Apply Gaussian prefilter only and save a Y4M artifact."""
     print(f"  [Pre Gaussian] 전처리-only Y4M 생성 중...")
     w, h, fps = get_video_metadata(input_video)
@@ -189,7 +191,7 @@ def run_spatial_preprocess(input_video: str, output_video: str,
 
     total_processed_frames = 0
     for y_array, u_np, v_np, frames, _ in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=0, scene_threshold=100.0
+        input_video, w, h, fps=fps, chunk_size=chunk_size, overlap=0, scene_threshold=100.0
     ):
         if total_processed_frames >= max_frames:
             break
@@ -209,7 +211,9 @@ def run_spatial_preprocess(input_video: str, output_video: str,
 
 def run_dwt3d_encoding(input_video: str, output_video: str, bitrate: str,
                         threshold: float = 0.03,
-                        max_frames: float = float('inf')) -> None:
+                        max_frames: float = float('inf'),
+                        chunk_size: int = 16,
+                        overlap: int = 4) -> None:
     """일반 3D DWT(PyWavelets Haar) 기반 전처리 후 인코딩하는 비교군을 생성합니다.
 
     DT-CWT와 동일한 청크/오버랩 조건을 부여하여 공정한 abaltion 비교를 수행합니다.
@@ -233,7 +237,7 @@ def run_dwt3d_encoding(input_video: str, output_video: str, bitrate: str,
 
     total_processed_frames = 0
     for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=4
+        input_video, w, h, fps=fps, chunk_size=chunk_size, overlap=overlap
     ):
         if total_processed_frames >= max_frames:
             break
@@ -265,7 +269,9 @@ def run_dwt3d_encoding(input_video: str, output_video: str, bitrate: str,
 
 def run_dwt3d_preprocess(input_video: str, output_video: str,
                          threshold: float = 0.03,
-                         max_frames: float = float('inf')) -> None:
+                         max_frames: float = float('inf'),
+                         chunk_size: int = 16,
+                         overlap: int = 4) -> None:
     """Apply 3D DWT only and save a Y4M artifact."""
     print(f"  [Pre DWT3D] 전처리-only Y4M 생성 중 (T={threshold})...")
     w, h, fps = get_video_metadata(input_video)
@@ -279,7 +285,7 @@ def run_dwt3d_preprocess(input_video: str, output_video: str,
 
     total_processed_frames = 0
     for y_array, u_np, v_np, frames, overlap_len in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=4
+        input_video, w, h, fps=fps, chunk_size=chunk_size, overlap=overlap
     ):
         if total_processed_frames >= max_frames:
             break
@@ -314,6 +320,9 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
                            max_frames: float = float('inf'),
                            disable_overlap: bool = False,
                            disable_adaptive: bool = False,
+                           chunk_size: int = 16,
+                           overlap: int = 4,
+                           process_chroma: bool = False,
                            threshold_mode: str = "adaptive",
                            controller_a: float = 0.35,
                            controller_b: float = 0.25,
@@ -362,11 +371,11 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
         log_writer.writerow(["chunk", "overlap", "bitrate_kbps", "noise", "motion",
                              "edge_density", "scene_cut", "threshold_mode", "multiplier"])
 
-    overlap_frames = 0 if disable_overlap else 4
+    overlap_frames = 0 if disable_overlap else overlap
     total_processed_frames = 0
     chunk_idx = 0
     for y_array, u_np, v_np, frames, overlap_len, scene_cut in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=overlap_frames,
+        input_video, w, h, fps=fps, chunk_size=chunk_size, overlap=overlap_frames,
         return_scene_change=True
     ):
         if total_processed_frames >= max_frames:
@@ -393,7 +402,10 @@ def run_proposed_encoding(input_video: str, output_video: str, bitrate: str,
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
         processed_y_flat = processed_y_uint8.reshape((valid_frames, -1))
 
-        u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
+        if process_chroma:
+            u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
+        else:
+            u_proc, v_proc = u_np, v_np
 
         for f in range(valid_frames):
             encoder_process.stdin.write(processed_y_flat[f].tobytes())
@@ -428,6 +440,9 @@ def run_proposed_preprocess(input_video: str, output_video: str,
                             max_frames: float = float('inf'),
                             disable_overlap: bool = False,
                             disable_adaptive: bool = False,
+                            chunk_size: int = 16,
+                            overlap: int = 4,
+                            process_chroma: bool = False,
                             threshold_mode: str = "adaptive",
                             controller_a: float = 0.35,
                             controller_b: float = 0.25,
@@ -455,11 +470,11 @@ def run_proposed_preprocess(input_video: str, output_video: str,
         disable_rate_aware_scene_reset=disable_rate_aware_scene_reset,
     )
 
-    overlap_frames = 0 if disable_overlap else 4
+    overlap_frames = 0 if disable_overlap else overlap
     total_processed_frames = 0
     chunk_idx = 0
     for y_array, u_np, v_np, frames, overlap_len, scene_cut in read_y4m_and_split(
-        input_video, w, h, fps=fps, chunk_size=8, overlap=overlap_frames,
+        input_video, w, h, fps=fps, chunk_size=chunk_size, overlap=overlap_frames,
         return_scene_change=True
     ):
         if total_processed_frames >= max_frames:
@@ -479,7 +494,10 @@ def run_proposed_preprocess(input_video: str, output_video: str,
         processed_y_uint8 = (processed_y_valid * 255.0).clip(0, 255).astype(np.uint8)
         processed_y_flat = processed_y_uint8.reshape((valid_frames, -1))
 
-        u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
+        if process_chroma:
+            u_proc, v_proc = processor.process_chroma(u_np, v_np, w, h)
+        else:
+            u_proc, v_proc = u_np, v_np
 
         for f in range(valid_frames):
             writer.stdin.write(processed_y_flat[f].tobytes())

@@ -163,12 +163,21 @@ If noisy conditions show positive ΔPSNR and clean conditions show near-zero or 
 
 ```bash
 # All videos × all noise levels × 5 bitrates
-# Takes ~1-2 hours on GPU, ~4-8 hours on CPU
+# RTX 3090/server run: reuse bitrate-independent preprocessing and clean temp videos
 uv run python run_noise_experiment.py \
     -v akiyo foreman mobile stefan \
     --sigma 0 5 10 15 \
-    -b 100 200 300 400 500
+    -b 100 200 300 400 500 \
+    -o outputs/paper_full \
+    --chunk_size 16 \
+    --reuse_preprocessed \
+    --cleanup_intermediates
 ```
+
+`--reuse_preprocessed` avoids recomputing hqdn3d/DWT/Gaussian/Proposed preprocessing for every bitrate.
+For the default `adaptive` mode, this reduces Proposed DT-CWT passes from one per bitrate to one per video/noise condition.
+If you switch to `--threshold_mode rate_aware`, Proposed is bitrate-dependent and is not reused, but the other prefilters still are.
+`--cleanup_intermediates` keeps CSV/PNG outputs and deletes regenerable `.mp4/.y4m` artifacts after each condition.
 
 For the standard RD curve comparison (without noise injection):
 ```bash

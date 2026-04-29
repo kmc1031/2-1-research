@@ -111,9 +111,24 @@ uv run python run_noise_experiment.py -v akiyo foreman mobile stefan
 # 빠른 검증용
 uv run python run_noise_experiment.py -v akiyo --sigma 0 10 -b 100 300 500
 
+# 서버/RTX 3090 권장 실행: 전처리 재사용 + 중간 비디오 자동 정리
+uv run python run_noise_experiment.py \
+  -v akiyo foreman mobile stefan \
+  --sigma 0 5 10 15 \
+  -b 100 200 300 400 500 \
+  -o outputs/paper_full \
+  --chunk_size 16 \
+  --reuse_preprocessed \
+  --cleanup_intermediates
+
 # pre-x264 ablation을 끄고 기존 post-x264 RD 실험만 실행
 uv run python run_noise_experiment.py -v akiyo --sigma 0 10 --no-include_precodec_ablation
 ```
+
+기본 `adaptive`/`fixed` 모드에서는 DT-CWT 전처리 결과가 bitrate와 독립적이므로,
+`--reuse_preprocessed`가 `pre_x264/*_prop.y4m`를 bitrate별 x264 인코딩에 재사용합니다.
+`rate_aware` 모드에서는 Proposed가 목표 bitrate에 따라 달라지므로 Proposed 재사용은 자동으로 비활성화되고, hqdn3d/DWT/Gaussian 전처리만 재사용됩니다.
+`--cleanup_intermediates`를 켜면 CSV/그래프 생성 후 재생성 가능한 `.mp4/.y4m` 중간 파일을 삭제합니다.
 
 출력물:
 - `pre_x264/*.y4m` — x264 이전 전처리-only ablation 결과
