@@ -13,8 +13,8 @@ from dtcwt_video.encoders import calculate_bd_rate
 from dtcwt_video.pipeline import get_video_metadata
 
 HIGHER_IS_BETTER_METRICS = {"psnr", "ssim", "vmaf", "msssim", "epsnr", "psnrb", "mepr"}
-LOWER_IS_BETTER_METRICS = {"gbim"}
-RELIABLE_PRIMARY_METRICS = ("psnr", "msssim", "psnrb", "epsnr")
+LOWER_IS_BETTER_METRICS = {"gbim", "strred"}
+RELIABLE_PRIMARY_METRICS = ("psnr", "msssim", "psnrb", "epsnr", "strred")
 
 
 def estimate_bitrate_kbps(file_size_bytes: int, duration_seconds: float) -> float:

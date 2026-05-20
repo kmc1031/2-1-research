@@ -80,7 +80,7 @@ def evaluate_and_plot_advanced(video_name, bitrate):
     # 2. Pixel & Block 기반 지표 측정
     cap_ref1 = cv2.VideoCapture(ref_vid)
     cap_base = cv2.VideoCapture(base_vid)
-    epsnr_b, psnrb_b, gbim_b, mepr_b = compute_custom_metrics(
+    epsnr_b, psnrb_b, gbim_b, mepr_b, _ = compute_custom_metrics(
         cap_ref1, cap_base, num_frames=60
     )
     cap_ref1.release()
@@ -88,7 +88,7 @@ def evaluate_and_plot_advanced(video_name, bitrate):
 
     cap_ref2 = cv2.VideoCapture(ref_vid)
     cap_prop = cv2.VideoCapture(prop_vid)
-    epsnr_p, psnrb_p, gbim_p, mepr_p = compute_custom_metrics(
+    epsnr_p, psnrb_p, gbim_p, mepr_p, _ = compute_custom_metrics(
         cap_ref2, cap_prop, num_frames=60
     )
     cap_ref2.release()

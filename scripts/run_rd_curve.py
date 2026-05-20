@@ -163,6 +163,7 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
     base_psnrbs, prop_psnrbs, spat_psnrbs, dwt_psnrbs = [], [], [], []
     base_gbims, prop_gbims, spat_gbims, dwt_gbims = [], [], [], []
     base_meprs, prop_meprs, spat_meprs, dwt_meprs = [], [], [], []
+    base_strreds, prop_strreds, spat_strreds, dwt_strreds = [], [], [], []
 
     for br in bitrates:
         br_str = f"{br}k"
@@ -191,25 +192,29 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
             run_spatial_encoding(input_video, spat_out, br_str)
 
         print(f"  [평가] {video_name} - {br_str} 결과 측정 중 (고급 지표 포함)...")
-        b_p, b_s, b_v, b_ms, b_ep, b_pb, b_gb, b_me = evaluate_video_quality(input_video, base_out, num_frames_custom=60)
-        d_p, d_s, d_v, d_ms, d_ep, d_pb, d_gb, d_me = evaluate_video_quality(input_video, dwt_out, num_frames_custom=60)
-        p_p, p_s, p_v, p_ms, p_ep, p_pb, p_gb, p_me = evaluate_video_quality(input_video, prop_out, num_frames_custom=60)
+        b_p, b_s, b_v, b_ms, b_ep, b_pb, b_gb, b_me, b_sr = evaluate_video_quality(input_video, base_out, num_frames_custom=60)
+        d_p, d_s, d_v, d_ms, d_ep, d_pb, d_gb, d_me, d_sr = evaluate_video_quality(input_video, dwt_out, num_frames_custom=60)
+        p_p, p_s, p_v, p_ms, p_ep, p_pb, p_gb, p_me, p_sr = evaluate_video_quality(input_video, prop_out, num_frames_custom=60)
         
         if include_spatial:
-            s_p, s_s, s_v, s_ms, s_ep, s_pb, s_gb, s_me = evaluate_video_quality(input_video, spat_out, num_frames_custom=60)
+            s_p, s_s, s_v, s_ms, s_ep, s_pb, s_gb, s_me, s_sr = evaluate_video_quality(input_video, spat_out, num_frames_custom=60)
             spat_psnrs.append(s_p); spat_ssims.append(s_s); spat_vmafs.append(s_v); spat_msssims.append(s_ms)
             spat_epsnrs.append(s_ep); spat_psnrbs.append(s_pb); spat_gbims.append(s_gb); spat_meprs.append(s_me)
+            spat_strreds.append(s_sr)
         else:
             s_p, s_v = float('nan'), float('nan')
 
         base_psnrs.append(b_p); base_ssims.append(b_s); base_vmafs.append(b_v); base_msssims.append(b_ms)
         base_epsnrs.append(b_ep); base_psnrbs.append(b_pb); base_gbims.append(b_gb); base_meprs.append(b_me)
+        base_strreds.append(b_sr)
         
         dwt_psnrs.append(d_p); dwt_ssims.append(d_s); dwt_vmafs.append(d_v); dwt_msssims.append(d_ms)
         dwt_epsnrs.append(d_ep); dwt_psnrbs.append(d_pb); dwt_gbims.append(d_gb); dwt_meprs.append(d_me)
+        dwt_strreds.append(d_sr)
         
         prop_psnrs.append(p_p); prop_ssims.append(p_s); prop_vmafs.append(p_v); prop_msssims.append(p_ms)
         prop_epsnrs.append(p_ep); prop_psnrbs.append(p_pb); prop_gbims.append(p_gb); prop_meprs.append(p_me)
+        prop_strreds.append(p_sr)
 
         # Plot advanced chart for this bitrate
         _plot_advanced_chart(
@@ -246,6 +251,7 @@ def process_single_video(video_name, input_dir, output_dir, bitrates, threshold,
         "base_psnrbs": base_psnrbs, "dwt_psnrbs": dwt_psnrbs, "prop_psnrbs": prop_psnrbs, "spat_psnrbs": spat_psnrbs if include_spatial else None,
         "base_gbims": base_gbims, "dwt_gbims": dwt_gbims, "prop_gbims": prop_gbims, "spat_gbims": spat_gbims if include_spatial else None,
         "base_meprs": base_meprs, "dwt_meprs": dwt_meprs, "prop_meprs": prop_meprs, "spat_meprs": spat_meprs if include_spatial else None,
+        "base_strreds": base_strreds, "dwt_strreds": dwt_strreds, "prop_strreds": prop_strreds, "spat_strreds": spat_strreds if include_spatial else None,
     }
 
 

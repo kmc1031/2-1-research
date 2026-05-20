@@ -125,12 +125,13 @@ def create_noisy_video(input_path, output_path, sigma, seed=42):
 #  단일 조건 실험
 # ============================================================================
 
-METRIC_NAMES = ['psnr', 'ssim', 'vmaf', 'msssim', 'epsnr', 'psnrb', 'gbim', 'mepr']
+METRIC_NAMES = ['psnr', 'ssim', 'vmaf', 'msssim', 'epsnr', 'psnrb', 'gbim', 'mepr', 'strred']
 PLOT_METRICS = [
     ('psnr', 'PSNR-Y (dB)', 'PSNR-Y'),
     ('msssim', 'MS-SSIM', 'MS-SSIM'),
     ('psnrb', 'PSNR-B (dB)', 'PSNR-B'),
     ('epsnr', 'Edge PSNR (dB)', 'EPSNR'),
+    ('strred', 'STRRED-like entropy distance (lower is better)', 'STRRED'),
 ]
 
 # 사용 가능한 비교군 키 → (표시명, 인코더 함수 or None(=Proposed))
