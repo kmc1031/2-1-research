@@ -1,0 +1,148 @@
+\documentclass[10pt]{article}
+\usepackage{kotex}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{subfigure}
+%%%%%%%%%%%%%%%%%
+\usepackage{titlesec}
+
+\titleformat{\section} 
+  {\centering\normalfont\large\sffamily\bfseries}
+  {\thesection.}
+  {1em}
+  {}
+\titleformat{\subsection} 
+  {\normalfont\normalsize\sffamily\bf}
+  {\thesubsection.}
+  {1em}
+  {\itshape}
+%%%%%%%%%%%%%%%%%%
+\renewcommand{\thesection}{\Roman{section}} 
+\def\thesubsection{\arabic{subsection}}
+ 
+%%%%%%%%%%%%%%%
+\usepackage{setspace}
+\setstretch{1.31}
+
+
+\textwidth 17.6cm \textheight 24.2cm
+\addtolength{\oddsidemargin}{-25mm}
+\addtolength{\topmargin}{-21mm}
+%\parskip 5mm
+%\parindent 3mm
+\setcounter{page}{0}
+ 
+ 
+   
+
+\begin{document}
+
+
+
+\begin{center}
+{ \LARGE \bf    논문 제목 }\\[12pt]
+ 학생. 지도교사 \\
+ 서울과학고등학교
+\\[12pt]
+{ \LARGE \bf    paper title }\\[12pt]
+ author, teacher \\
+ Seoul Science High School
+  \\[12pt]
+{\large \bf  국문 초록}
+  \noindent\rule{\textwidth}{0.4pt}
+%
+  \begin{flushleft}  
+  초록을 작성할 때는 연구 주제의 목적과 결과, 알아낸 사실들을 일목요연하게 정리하여 연구 전체를 하나의 문단으로 요약한다. 첫 줄은 들여쓰기하지 않으며 400단어 내외로 작성한다. ‘초록 내용’
+주제어: 논문에서 다룬 5개 이내의 키워드. 제목에 사용된 단어가 포함해야 한다. ‘초록 내용’
+  \noindent\rule{\textwidth}{0.4pt}
+\end{flushleft}  
+{\large \bf Abstract}
+  \noindent\rule{\textwidth}{0.4pt}
+    \begin{flushleft}  
+When writing an abstract, summarize the entire research in one paragraph by arranging the purpose, results, and findings of the research topic at a glance. The first line is not indented and should be written within 400 words. ‘Abstract’
+Keywords: List of 5 or less keywords covered in the paper. The words used in the title should be included.  ‘Abstract’
+  \noindent\rule{\textwidth}{0.4pt}
+\end{flushleft} 
+  \end{center} 
+
+ 
+%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{\large \bf 서론(Introduction) }
+%%%%%%%%%%%%%%%%%%%%%%%%%
+‘본문’스타일을을 사용한다. 강조할 단어에는 ‘굵게’스타일이나 ‘기울임’스타일을 사용한다. 
+이 연구를 수행하게 된 이유와 목적, 연구의 동기와 필요성을 한두 문단으로 기술한다. 
+
+
+%%%%%%%%%%%%%%%%%%%%%%
+\section{\large \bf 이론적 배경(Theory \& Principle)}
+%%%%%%%%%%%%%%%%%%%%%%
+‘본문’스타일을 사용한다. 
+이 연구가 시행되기 이전의 선행연구를 소개하여 연구 결과를 이해하기 전 알아야 할 사전 지식을 제공해야 한다. 
+정리 2.1 ([인용논문,정리번호]) (선택사항) 본 연구와 관련된 정리를 서술한다.
+정의 2.2 (선택사항) 본 연구와 관련된 정의를 서술한다.
+ 
+ 
+ %%%%%%%%%%%%%%%%%%%%%%%
+\section{\large \bf 연구 관련 제목(Chpater Name Related Research)}
+%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{\large \bf  (선택사항) 결론 및 제언(Conclusion and Proposal)}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+본문’스타일을 사용한다. 실험에서 연구의 가설을 설명하기 위해 시행했던 시험의 결과결과들을 보여주어야 하며, 각 실험들은 사진이나 그래프, 표 등으로 한눈에 알아볼 수 있도록 제시해주어야 한다.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% 
+\begin{figure} [hbtp]
+\centering
+\includegraphics[scale=.4]{20240527_125844.jpg}
+\caption{ Cross section  of a birdbath  type   optics system in the vertical direction }%
+\label{fig2}
+\end{figure}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% 
+
+
+
+
+ 
+%%%%%%%%%%%%%%%%%%%%%%
+\section*{\large \bf 보충 자료(Supplemental Information) }
+%%%%%%%%%%%%%%%%%%%%%%
+\appendix
+\renewcommand{\theequation}{A.\arabic{equation}}
+\setcounter{equation}{0}
+{\subsection{\large \bf About quantum field}}
+%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begingroup
+\titleformat*{\section}  {\centering\normalfont\large\sffamily\bfseries}
+\begin{thebibliography}{100}
+
+\bibitem{Ykwon}
+Y.~Kwon,
+``Defy gravity in quantum field,''
+Class.\ Quant. Grav.\ {\bf 19}, 9999 (2024) 
+\end{thebibliography}
+
+\endgroup
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%---(Alternatively)----%%%%%%%%%%%%%%%
+%\bibliographystyle{unsrt}
+%\bibliography{biblio}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+
+
+
+\end{document}
+
+
+
+
